@@ -1,5 +1,5 @@
 #include "mpeg2/ps_muxer.h"
-#include "mpeg2/h264_utils.h"
+#include "mpeg2/codec_utils.h"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -9,12 +9,22 @@ using namespace mpeg2;
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <input_h264_file> <output_ps_file>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <input_file> <output_ps_file> [interval_ms]" << std::endl;
         return 1;
     }
 
     std::string input_file = argv[1];
     std::string output_file = argv[2];
+
+    bool is_h265 = false;
+    if (input_file.size() >= 5 && input_file.substr(input_file.size() - 5) == ".h265") {
+        is_h265 = true;
+    }
+
+    int interval = 40; // Default 40ms (25fps)
+    if (argc >= 4) {
+        interval = std::stoi(argv[3]);
+    }
 
     std::ofstream out(output_file, std::ios::binary);
     if (!out) {
@@ -23,7 +33,7 @@ int main(int argc, char** argv) {
     }
 
     PSMuxer muxer;
-    uint8_t stream_id = muxer.AddStream(PS_STREAM_H264);
+    uint8_t stream_id = muxer.AddStream(is_h265 ? PS_STREAM_H265 : PS_STREAM_H264);
     
     muxer.SetOnPacket([&](const std::vector<uint8_t>& packet) {
         out.write((const char*)packet.data(), packet.size());
@@ -47,27 +57,57 @@ int main(int argc, char** argv) {
     bool has_vcl = false;
 
     H264Utils::SplitFrame(buffer.data(), size, [&](const uint8_t* nalu, size_t len) {
-        int type = H264Utils::GetNaluType(nalu, len);
-        bool is_vcl = H264Utils::IsH264VCL(nalu, len);
-        bool is_aud = H264Utils::IsH264AUD(nalu, len);
-        bool is_sps = (type == H264_NAL_SPS);
-        bool is_pps = (type == H264_NAL_PPS);
-
         bool new_au = false;
-        if (is_aud) new_au = true;
-        if (is_sps || is_pps) {
-            if (has_vcl) new_au = true;
-        }
-        if (is_vcl) {
-            if (has_vcl) {
-                new_au = true;
+        bool is_vcl = false;
+        bool is_aud = false;
+        bool is_sps_pps = false;
+
+        if (is_h265) {
+            int type = H264Utils::GetH265NaluType(nalu, len);
+            is_vcl = H264Utils::IsH265VCL(nalu, len);
+            is_aud = H264Utils::IsH265AUD(nalu, len);
+            if (type == H265_NAL_VPS || type == H265_NAL_SPS || type == H265_NAL_PPS) {
+                is_sps_pps = true;
+            }
+            
+            if (is_aud) new_au = true;
+            if (is_sps_pps) {
+                if (has_vcl) new_au = true;
+            }
+            if (is_vcl) {
+                if (has_vcl) {
+                    // Check if it is the first slice of a new picture
+                    if (H264Utils::IsH265FirstSlice(nalu, len)) {
+                        new_au = true;
+                    }
+                }
+            }
+        } else {
+            int type = H264Utils::GetNaluType(nalu, len);
+            is_vcl = H264Utils::IsH264VCL(nalu, len);
+            is_aud = H264Utils::IsH264AUD(nalu, len);
+            if (type == H264_NAL_SPS || type == H264_NAL_PPS) {
+                is_sps_pps = true;
+            }
+
+            if (is_aud) new_au = true;
+            if (is_sps_pps) {
+                if (has_vcl) new_au = true;
+            }
+            if (is_vcl) {
+                if (has_vcl) {
+                    // Check if it is the first slice of a new picture
+                    if (H264Utils::IsH264FirstSlice(nalu, len)) {
+                        new_au = true;
+                    }
+                }
             }
         }
 
         if (new_au && !au_buffer.empty()) {
             muxer.Write(stream_id, au_buffer.data(), au_buffer.size(), pts, dts);
-            pts += 3600;
-            dts += 3600;
+            pts += interval;
+            dts += interval;
             au_buffer.clear();
             has_vcl = false;
         }

@@ -1,6 +1,6 @@
 #include "mpeg2/ts_muxer.h"
 #include "mpeg2/utils.h"
-#include "mpeg2/h264_utils.h"
+#include "mpeg2/codec_utils.h"
 #include <iostream>
 
 namespace mpeg2 {
@@ -76,13 +76,11 @@ void TSMuxer::Write(uint16_t pid, const uint8_t* data, size_t size, uint64_t pts
         H264Utils::SplitFrame(data, size, [&](const uint8_t* nalu, size_t len) {
             if (H264Utils::IsH264AUD(nalu, len)) {
                 with_aud = true;
-                return false; 
             }
             if (H264Utils::IsH264VCL(nalu, len)) {
                 if (H264Utils::IsH264IDR(nalu, len)) {
                     idr_flag = true;
                 }
-                return false;
             }
             return true;
         });
@@ -90,13 +88,11 @@ void TSMuxer::Write(uint16_t pid, const uint8_t* data, size_t size, uint64_t pts
         H264Utils::SplitFrame(data, size, [&](const uint8_t* nalu, size_t len) {
             if (H264Utils::IsH265AUD(nalu, len)) {
                 with_aud = true;
-                return false;
             }
             if (H264Utils::IsH265VCL(nalu, len)) {
                 if (H264Utils::IsH265IDR(nalu, len)) {
                     idr_flag = true;
                 }
-                return false;
             }
             return true;
         });
@@ -158,18 +154,6 @@ void TSMuxer::WritePat() {
     bsw.SetUint16((section_length & 0x0FFF) | (1 << 15) | 0x3000, loc);
     
     uint32_t crc = CalcCrc32(0xFFFFFFFF, bsw.Bits().data() + section_start - 3, section_length - 4 + 3);
-    bsw.PutUint32(crc, 32); // Actually PutUint32 writes big endian? No, implementation uses PutUint64 which writes big endian.
-    // CRC32 in MPEG-2 is usually Little Endian? 
-    // Go code: binary.LittleEndian.PutUint32(tmpcrc, crc); bsw.PutBytes(tmpcrc);
-    // My PutUint32 is Big Endian (network byte order).
-    // So I should write it manually or add PutUint32LE.
-    // Or just:
-    bsw.SetByte(crc & 0xFF, bsw.Size());
-    bsw.SetByte((crc >> 8) & 0xFF, bsw.Size() + 1);
-    bsw.SetByte((crc >> 16) & 0xFF, bsw.Size() + 2);
-    bsw.SetByte((crc >> 24) & 0xFF, bsw.Size() + 3);
-    // Wait, SetByte is for overwriting. I need to append.
-    // I'll just use PutByte 4 times.
     bsw.PutByte(crc & 0xFF);
     bsw.PutByte((crc >> 8) & 0xFF);
     bsw.PutByte((crc >> 16) & 0xFF);
@@ -351,16 +335,18 @@ void TSMuxer::WritePes(PmtStream& stream, Pmt& pmt, const uint8_t* data, size_t 
             // If video, can be 0 if too large? Go code says: if headlen-oldheadlen-6+len(data) > 0xFFFF -> 0
             // But here we are calculating PES packet length field.
             // For video, if length > 0xFFFF, set to 0.
-            if (total_data_len + 3 + 5 + 5 > 0xFFFF) { // approx header size
+            // For video, if length > 0xFFFF, set to 0.
+            // Actually, for video streams, it is often safer to set PES_packet_length to 0 (unbounded)
+            // to avoid issues if the frame is larger than 64KB, and some players/tools prefer it.
+            // The previous logic tried to calculate it but might be overflowing or incorrect for large frames.
+            if (stream.stream_type == TS_STREAM_H264 || stream.stream_type == TS_STREAM_H265) {
                  pes_packet_len = 0;
             } else {
-                 pes_packet_len = total_data_len + 3 + 5 + 5; // PTS/DTS flags (2) + header len (1) + PTS (5) + DTS (5)
-                 // Wait, this is rough.
-                 // Let's do it properly.
-                 // PES header data length = 10 (PTS + DTS)
-                 // Total PES header size = 6 + 3 + 10 = 19 bytes.
-                 // So len = data + 13.
-                 pes_packet_len = total_data_len + 13;
+                 if (total_data_len + 3 + 5 + 5 > 0xFFFF) {
+                     pes_packet_len = 0;
+                 } else {
+                     pes_packet_len = total_data_len + 13;
+                 }
             }
             pes_hdr.PutUint16(pes_packet_len, 16);
             

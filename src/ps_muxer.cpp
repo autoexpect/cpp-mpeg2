@@ -1,6 +1,6 @@
 #include "mpeg2/ps_muxer.h"
 #include "mpeg2/utils.h"
-#include "mpeg2/h264_utils.h"
+#include "mpeg2/codec_utils.h"
 #include <iostream>
 
 namespace mpeg2 {

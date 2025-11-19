@@ -1,5 +1,5 @@
-#ifndef MPEG2_H264_UTILS_H
-#define MPEG2_H264_UTILS_H
+#ifndef MPEG2_CODEC_UTILS_H
+#define MPEG2_CODEC_UTILS_H
 
 #include <cstdint>
 #include <vector>
@@ -64,13 +64,15 @@ public:
     static bool IsH264IDR(const uint8_t* nalu, size_t len);
     static bool IsH264AUD(const uint8_t* nalu, size_t len);
     static bool IsH264VCL(const uint8_t* nalu, size_t len);
+    static bool IsH264FirstSlice(const uint8_t* nalu, size_t len);
 
     static int GetH265NaluType(const uint8_t* nalu, size_t len);
     static bool IsH265IDR(const uint8_t* nalu, size_t len);
     static bool IsH265AUD(const uint8_t* nalu, size_t len);
     static bool IsH265VCL(const uint8_t* nalu, size_t len);
+    static bool IsH265FirstSlice(const uint8_t* nalu, size_t len);
 };
 
 } // namespace mpeg2
 
-#endif // MPEG2_H264_UTILS_H
+#endif // MPEG2_CODEC_UTILS_H
