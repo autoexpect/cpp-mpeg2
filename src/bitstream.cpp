@@ -1,232 +1,252 @@
-#include "bitstream.h"
+#include "mpeg2/bitstream.h"
+#include <stdexcept>
+#include <cstring>
+#include <algorithm>
 
 namespace mpeg2 {
 
-BitStream::BitStream(const uint8_t* data, size_t size)
-    : data_(data), size_(size), byte_pos_(0), bit_pos_(0) {
-}
+static const uint8_t BitMask[8] = {0x01, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7F, 0xFF};
 
-BitStream::BitStream(const std::vector<uint8_t>& data)
-    : data_(data.data()), size_(data.size()), byte_pos_(0), bit_pos_(0) {
-}
+BitStream::BitStream(const uint8_t* buf, size_t size)
+    : bits_(buf), size_(size), bytesOffset_(0), bitsOffset_(0) {}
 
-uint32_t BitStream::Uint8(uint32_t bits) {
-    if (bits > 8 || bits == 0) {
-        throw std::runtime_error("Invalid bit count for Uint8");
+BitStream::~BitStream() {}
+
+uint8_t BitStream::GetBit() {
+    if (bytesOffset_ >= size_) {
+        throw std::out_of_range("OUT OF RANGE");
     }
-    return static_cast<uint32_t>(Uint32(bits));
+    uint8_t ret = (bits_[bytesOffset_] >> (7 - bitsOffset_)) & 0x01;
+    bitsOffset_++;
+    if (bitsOffset_ >= 8) {
+        bytesOffset_++;
+        bitsOffset_ = 0;
+    }
+    return ret;
 }
 
-uint32_t BitStream::Uint16(uint32_t bits) {
-    if (bits > 16 || bits == 0) {
-        throw std::runtime_error("Invalid bit count for Uint16");
+uint64_t BitStream::GetBits(int n) {
+    if (bytesOffset_ >= size_) {
+        throw std::out_of_range("OUT OF RANGE");
     }
-    return static_cast<uint32_t>(Uint32(bits));
-}
-
-uint32_t BitStream::Uint32(uint32_t bits) {
-    if (bits > 32 || bits == 0) {
-        throw std::runtime_error("Invalid bit count for Uint32");
-    }
-    
-    uint32_t result = 0;
-    for (uint32_t i = 0; i < bits; i++) {
-        if (byte_pos_ >= size_) {
-            throw std::runtime_error("BitStream: insufficient data");
+    uint64_t ret = 0;
+    if (8 - bitsOffset_ >= n) {
+        ret = (uint64_t)((bits_[bytesOffset_] >> (8 - bitsOffset_ - n)) & BitMask[n - 1]);
+        bitsOffset_ += n;
+        if (bitsOffset_ == 8) {
+            bytesOffset_++;
+            bitsOffset_ = 0;
         }
-        
-        uint8_t bit = (data_[byte_pos_] >> (7 - bit_pos_)) & 1;
-        result = (result << 1) | bit;
-        
-        bit_pos_++;
-        if (bit_pos_ == 8) {
-            bit_pos_ = 0;
-            byte_pos_++;
-        }
-    }
-    
-    return result;
-}
-
-uint64_t BitStream::Uint64(uint32_t bits) {
-    if (bits > 64 || bits == 0) {
-        throw std::runtime_error("Invalid bit count for Uint64");
-    }
-    
-    uint64_t result = 0;
-    for (uint32_t i = 0; i < bits; i++) {
-        if (byte_pos_ >= size_) {
-            throw std::runtime_error("BitStream: insufficient data");
-        }
-        
-        uint8_t bit = (data_[byte_pos_] >> (7 - bit_pos_)) & 1;
-        result = (result << 1) | bit;
-        
-        bit_pos_++;
-        if (bit_pos_ == 8) {
-            bit_pos_ = 0;
-            byte_pos_++;
+    } else {
+        ret = (uint64_t)(bits_[bytesOffset_] & BitMask[8 - bitsOffset_ - 1]);
+        bytesOffset_++;
+        n -= 8 - bitsOffset_;
+        bitsOffset_ = 0;
+        while (n > 0) {
+            if (bytesOffset_ >= size_) {
+                throw std::out_of_range("OUT OF RANGE");
+            }
+            if (n >= 8) {
+                ret = (ret << 8) | (uint64_t)(bits_[bytesOffset_]);
+                bytesOffset_++;
+                n -= 8;
+            } else {
+                ret = (ret << n) | (uint64_t)((bits_[bytesOffset_] >> (8 - n)) & BitMask[n - 1]);
+                bitsOffset_ = n;
+                break;
+            }
         }
     }
-    
-    return result;
+    return ret;
 }
 
-uint32_t BitStream::NextBits(uint32_t bits) {
-    size_t saved_byte_pos = byte_pos_;
-    uint8_t saved_bit_pos = bit_pos_;
-    
-    uint32_t result = Uint32(bits);
-    
-    byte_pos_ = saved_byte_pos;
-    bit_pos_ = saved_bit_pos;
-    
-    return result;
-}
-
-void BitStream::SkipBits(uint32_t bits) {
-    for (uint32_t i = 0; i < bits; i++) {
-        if (byte_pos_ >= size_) {
-            throw std::runtime_error("BitStream: insufficient data");
-        }
-        
-        bit_pos_++;
-        if (bit_pos_ == 8) {
-            bit_pos_ = 0;
-            byte_pos_++;
-        }
+void BitStream::SkipBits(int n) {
+    int bytecount = n / 8;
+    int bitscount = n % 8;
+    bytesOffset_ += bytecount;
+    if (bitsOffset_ + bitscount < 8) {
+        bitsOffset_ += bitscount;
+    } else {
+        bytesOffset_ += 1;
+        bitsOffset_ += bitscount - 8;
     }
 }
 
-size_t BitStream::RemainBytes() const {
-    if (byte_pos_ >= size_) {
+uint8_t BitStream::Uint8(int n) {
+    return (uint8_t)GetBits(n);
+}
+
+uint16_t BitStream::Uint16(int n) {
+    return (uint16_t)GetBits(n);
+}
+
+uint32_t BitStream::Uint32(int n) {
+    return (uint32_t)GetBits(n);
+}
+
+std::vector<uint8_t> BitStream::GetBytes(int n) {
+    if (bytesOffset_ + n > size_) {
+        throw std::out_of_range("OUT OF RANGE");
+    }
+    if (bitsOffset_ != 0) {
+        throw std::runtime_error("invalid operation: bitsOffset != 0");
+    }
+    std::vector<uint8_t> data(bits_ + bytesOffset_, bits_ + bytesOffset_ + n);
+    bytesOffset_ += n;
+    return data;
+}
+
+uint64_t BitStream::ReadUE() {
+    int leadingZeroBits = 0;
+    while (GetBit() == 0) {
+        leadingZeroBits++;
+    }
+    if (leadingZeroBits == 0) {
         return 0;
     }
-    size_t remain = size_ - byte_pos_;
-    if (bit_pos_ > 0) {
-        remain--;
+    uint64_t info = GetBits(leadingZeroBits);
+    return ((uint64_t)1 << leadingZeroBits) - 1 + info;
+}
+
+int64_t BitStream::ReadSE() {
+    uint64_t v = ReadUE();
+    if (v % 2 == 0) {
+        return -1 * (int64_t)(v / 2);
+    } else {
+        return (int64_t)(v + 1) / 2;
     }
-    return remain;
 }
 
-size_t BitStream::RemainBits() const {
-    if (byte_pos_ >= size_) {
-        return 0;
+int BitStream::RemainBits() {
+    if (bitsOffset_ > 0) {
+        return (size_ - bytesOffset_ - 1) * 8 + (8 - bitsOffset_);
+    } else {
+        return (size_ - bytesOffset_) * 8;
     }
-    size_t remain_bytes = size_ - byte_pos_;
-    return remain_bytes * 8 - bit_pos_;
 }
 
-const uint8_t* BitStream::RemainData() const {
-    if (byte_pos_ >= size_) {
-        return nullptr;
+int BitStream::RemainBytes() {
+    if (bitsOffset_ > 0) {
+        return size_ - bytesOffset_ - 1;
+    } else {
+        return size_ - bytesOffset_;
     }
-    return data_ + byte_pos_;
 }
 
-bool BitStream::EOS() const {
-    return byte_pos_ >= size_ || (byte_pos_ == size_ - 1 && bit_pos_ >= 8);
-}
-
-// BitStreamWriter implementation
-
-BitStreamWriter::BitStreamWriter(size_t capacity)
-    : current_byte_(0), bit_pos_(0) {
-    buffer_.reserve(capacity);
-}
-
-void BitStreamWriter::PutByte(uint8_t val) {
-    if (bit_pos_ != 0) {
-        FlushByte();
+BitStreamWriter::BitStreamWriter(int n)
+    : bits_(n), byteOffset_(0), bitOffset_(0) {
+        std::fill(bits_.begin(), bits_.end(), 0);
     }
-    buffer_.push_back(val);
+
+BitStreamWriter::~BitStreamWriter() {}
+
+void BitStreamWriter::expandSpace(int n) {
+    if ((bits_.size() - byteOffset_ - 1) * 8 + 8 - bitOffset_ < (size_t)n) {
+        size_t newlen = 0;
+        if (bits_.size() * 8 < (size_t)n) {
+            newlen = bits_.size() + n / 8 + 1;
+        } else {
+            newlen = bits_.size() * 2;
+        }
+        bits_.resize(newlen, 0);
+    }
 }
 
-void BitStreamWriter::PutUint8(uint8_t val, uint32_t bits) {
-    if (bits > 8 || bits == 0) {
-        throw std::runtime_error("Invalid bit count for PutUint8");
+void BitStreamWriter::PutByte(uint8_t v) {
+    expandSpace(8);
+    if (bitOffset_ == 0) {
+        bits_[byteOffset_] = v;
+        byteOffset_++;
+    } else {
+        bits_[byteOffset_] |= v >> bitOffset_;
+        byteOffset_++;
+        bits_[byteOffset_] = v & BitMask[bitOffset_ - 1];
     }
-    PutUint32(val, bits);
 }
 
-void BitStreamWriter::PutUint16(uint16_t val, uint32_t bits) {
-    if (bits > 16 || bits == 0) {
-        throw std::runtime_error("Invalid bit count for PutUint16");
+void BitStreamWriter::PutBytes(const uint8_t* v, size_t size) {
+    if (bitOffset_ != 0) {
+        throw std::runtime_error("bsw.bitsoffset > 0");
     }
-    PutUint32(val, bits);
+    expandSpace(8 * size);
+    std::memcpy(&bits_[byteOffset_], v, size);
+    byteOffset_ += size;
 }
 
-void BitStreamWriter::PutUint32(uint32_t val, uint32_t bits) {
-    if (bits > 32 || bits == 0) {
-        throw std::runtime_error("Invalid bit count for PutUint32");
-    }
-    
-    for (int i = bits - 1; i >= 0; i--) {
-        uint8_t bit = (val >> i) & 1;
-        current_byte_ = (current_byte_ << 1) | bit;
-        bit_pos_++;
-        
-        if (bit_pos_ == 8) {
-            buffer_.push_back(current_byte_);
-            current_byte_ = 0;
-            bit_pos_ = 0;
+void BitStreamWriter::PutBytes(const std::vector<uint8_t>& v) {
+    PutBytes(v.data(), v.size());
+}
+
+void BitStreamWriter::PutUint8(uint8_t v, int n) {
+    PutUint64((uint64_t)v, n);
+}
+
+void BitStreamWriter::PutUint16(uint16_t v, int n) {
+    PutUint64((uint64_t)v, n);
+}
+
+void BitStreamWriter::PutUint32(uint32_t v, int n) {
+    PutUint64((uint64_t)v, n);
+}
+
+void BitStreamWriter::PutUint64(uint64_t v, int n) {
+    expandSpace(n);
+    if (8 - bitOffset_ >= n) {
+        bits_[byteOffset_] |= ((uint8_t)(v) & BitMask[n - 1]) << (8 - bitOffset_ - n);
+        bitOffset_ += n;
+        if (bitOffset_ == 8) {
+            bitOffset_ = 0;
+            byteOffset_++;
+        }
+    } else {
+        bits_[byteOffset_] |= (uint8_t)(v >> (n - (8 - bitOffset_))) & BitMask[8 - bitOffset_ - 1];
+        byteOffset_++;
+        n -= 8 - bitOffset_;
+        while (n - 8 >= 0) {
+            bits_[byteOffset_] = (uint8_t)(v >> (n - 8)) & 0xFF;
+            byteOffset_++;
+            n -= 8;
+        }
+        bitOffset_ = n;
+        if (n > 0) {
+            bits_[byteOffset_] |= ((uint8_t)(v) & BitMask[n - 1]) << (8 - n);
         }
     }
 }
 
-void BitStreamWriter::PutUint64(uint64_t val, uint32_t bits) {
-    if (bits > 64 || bits == 0) {
-        throw std::runtime_error("Invalid bit count for PutUint64");
-    }
-    
-    for (int i = bits - 1; i >= 0; i--) {
-        uint8_t bit = (val >> i) & 1;
-        current_byte_ = (current_byte_ << 1) | bit;
-        bit_pos_++;
-        
-        if (bit_pos_ == 8) {
-            buffer_.push_back(current_byte_);
-            current_byte_ = 0;
-            bit_pos_ = 0;
-        }
+void BitStreamWriter::SetByte(uint8_t v, size_t where) {
+    if (where < bits_.size()) {
+        bits_[where] = v;
     }
 }
 
-void BitStreamWriter::PutBytes(const uint8_t* data, size_t size) {
-    if (bit_pos_ != 0) {
-        FlushByte();
+void BitStreamWriter::SetUint16(uint16_t v, size_t where) {
+    if (where + 1 < bits_.size()) {
+        bits_[where] = (v >> 8) & 0xFF;
+        bits_[where + 1] = v & 0xFF;
     }
-    buffer_.insert(buffer_.end(), data, data + size);
+}
+
+void BitStreamWriter::FillRemainData(uint8_t v) {
+    for (size_t i = byteOffset_; i < bits_.size(); i++) {
+        bits_[i] = v;
+    }
+    byteOffset_ = bits_.size();
+    bitOffset_ = 0;
 }
 
 void BitStreamWriter::Reset() {
-    buffer_.clear();
-    current_byte_ = 0;
-    bit_pos_ = 0;
+    std::fill(bits_.begin(), bits_.end(), 0);
+    bitOffset_ = 0;
+    byteOffset_ = 0;
 }
 
-void BitStreamWriter::FlushByte() {
-    if (bit_pos_ > 0) {
-        current_byte_ <<= (8 - bit_pos_);
-        buffer_.push_back(current_byte_);
-        current_byte_ = 0;
-        bit_pos_ = 0;
-    }
+const std::vector<uint8_t>& BitStreamWriter::Bits() const {
+    return bits_;
 }
 
-std::vector<uint8_t> BitStreamWriter::Bytes() {
-    FlushByte();
-    return buffer_;
-}
-
-void BitStreamWriter::FillRemainData(uint8_t value) {
-    FlushByte();
-    // Fill any remaining capacity with the specified value
-    // This is used for TS packet stuffing
-    size_t current_size = buffer_.size();
-    if (buffer_.capacity() > current_size) {
-        buffer_.resize(buffer_.capacity(), value);
-    }
+size_t BitStreamWriter::Size() const {
+    return byteOffset_ + (bitOffset_ > 0 ? 1 : 0);
 }
 
 } // namespace mpeg2

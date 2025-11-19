@@ -1,166 +1,343 @@
-#include "ps_muxer.h"
-#include <algorithm>
+#include "mpeg2/ps_muxer.h"
+#include "mpeg2/utils.h"
+#include "mpeg2/h264_utils.h"
+#include <iostream>
 
 namespace mpeg2 {
 
-PSMuxer::PSMuxer()
-    : first_frame_(true) {
-    system_ = std::make_unique<SystemHeader>();
-    system_->rate_bound = 26234;
+PSMuxer::PSMuxer() : first_frame_(true) {
+    system_header_.rate_bound = 26234;
+    system_header_.audio_bound = 0;
+    system_header_.video_bound = 0;
     
-    psm_ = std::make_unique<ProgramStreamMap>();
-    psm_->current_next_indicator = 1;
-    psm_->program_stream_map_version = 1;
+    psm_.current_next_indicator = 1;
+    psm_.program_stream_map_version = 1;
 }
 
-PSMuxer::~PSMuxer() = default;
+PSMuxer::~PSMuxer() {}
 
-uint8_t PSMuxer::AddStream(PSStreamType cid) {
-    if (cid == PSStreamType::H265 || cid == PSStreamType::H264) {
-        ElementaryStream es(static_cast<uint8_t>(PESStreamID::STREAM_VIDEO) + system_->video_bound);
+uint8_t PSMuxer::AddStream(PS_STREAM_TYPE type) {
+    uint8_t stream_id = 0;
+    if (type == PS_STREAM_H264 || type == PS_STREAM_H265) {
+        stream_id = 0xE0 + system_header_.video_bound;
+        ElementaryStream es;
+        es.stream_id = stream_id;
         es.p_std_buffer_bound_scale = 1;
         es.p_std_buffer_size_bound = 400;
-        system_->streams.push_back(es);
-        system_->video_bound++;
+        system_header_.streams.push_back(es);
+        system_header_.video_bound++;
         
-        psm_->stream_map.push_back(ElementaryStreamElem(static_cast<uint8_t>(cid), es.stream_id));
-        psm_->program_stream_map_version++;
-        return es.stream_id;
+        ElementaryStreamElem elem;
+        elem.stream_type = (uint8_t)type;
+        elem.elementary_stream_id = stream_id;
+        psm_.stream_map.push_back(elem);
     } else {
-        ElementaryStream es(static_cast<uint8_t>(PESStreamID::STREAM_AUDIO) + system_->audio_bound);
+        stream_id = 0xC0 + system_header_.audio_bound;
+        ElementaryStream es;
+        es.stream_id = stream_id;
         es.p_std_buffer_bound_scale = 0;
         es.p_std_buffer_size_bound = 32;
-        system_->streams.push_back(es);
-        system_->audio_bound++;
+        system_header_.streams.push_back(es);
+        system_header_.audio_bound++;
         
-        psm_->stream_map.push_back(ElementaryStreamElem(static_cast<uint8_t>(cid), es.stream_id));
-        psm_->program_stream_map_version++;
-        return es.stream_id;
+        ElementaryStreamElem elem;
+        elem.stream_type = (uint8_t)type;
+        elem.elementary_stream_id = stream_id;
+        psm_.stream_map.push_back(elem);
     }
+    psm_.program_stream_map_version++;
+    return stream_id;
 }
 
-int PSMuxer::Write(uint8_t sid, const std::vector<uint8_t>& frame, uint64_t pts, uint64_t dts) {
-    // Find stream
+void PSMuxer::SetOnPacket(std::function<void(const std::vector<uint8_t>&)> callback) {
+    on_packet_ = callback;
+}
+
+void PSMuxer::Write(uint8_t stream_id, const uint8_t* data, size_t size, uint64_t pts, uint64_t dts) {
     ElementaryStreamElem* stream = nullptr;
-    for (auto& es : psm_->stream_map) {
-        if (es.elementary_stream_id == sid) {
-            stream = &es;
+    for (auto& s : psm_.stream_map) {
+        if (s.elementary_stream_id == stream_id) {
+            stream = &s;
             break;
         }
     }
-    
-    if (!stream) {
-        return static_cast<int>(Mpeg2Error::NOT_FOUND);
-    }
-    
-    if (frame.empty()) {
-        return static_cast<int>(Mpeg2Error::SUCCESS);
-    }
-    
+    if (!stream) return;
+    if (size == 0) return;
+
     bool with_aud = false;
     bool idr_flag = false;
     bool vcl = false;
-    
-    PSStreamType stream_type = static_cast<PSStreamType>(stream->stream_type);
-    
-    // Check for AUD NALU (simplified - would need full codec implementation)
-    if (stream_type == PSStreamType::H264 || stream_type == PSStreamType::H265) {
-        // Simplified check - in real implementation would parse NALUs
-        if (frame.size() >= 6) {
-            if (stream_type == PSStreamType::H264) {
-                if (frame[0] == 0 && frame[1] == 0 && frame[2] == 0 && 
-                    frame[3] == 1 && (frame[4] & 0x1F) == 9) {
-                    with_aud = true;
-                }
-            } else {
-                if (frame[0] == 0 && frame[1] == 0 && frame[2] == 0 && 
-                    frame[3] == 1 && ((frame[4] >> 1) & 0x3F) == 35) {
-                    with_aud = true;
-                }
+
+    if (stream->stream_type == PS_STREAM_H264) {
+        H264Utils::SplitFrame(data, size, [&](const uint8_t* nalu, size_t len) {
+            if (H264Utils::IsH264AUD(nalu, len)) {
+                with_aud = true;
+                return false;
             }
-        }
+            if (H264Utils::IsH264VCL(nalu, len)) {
+                if (H264Utils::IsH264IDR(nalu, len)) {
+                    idr_flag = true;
+                }
+                vcl = true;
+                return false;
+            }
+            return true;
+        });
+    } else if (stream->stream_type == PS_STREAM_H265) {
+        H264Utils::SplitFrame(data, size, [&](const uint8_t* nalu, size_t len) {
+            if (H264Utils::IsH265AUD(nalu, len)) {
+                with_aud = true;
+                return false;
+            }
+            if (H264Utils::IsH265VCL(nalu, len)) {
+                if (H264Utils::IsH265IDR(nalu, len)) {
+                    idr_flag = true;
+                }
+                vcl = true;
+                return false;
+            }
+            return true;
+        });
     }
-    
-    // Convert timestamps to 90kHz
-    dts = dts * 90;
-    pts = pts * 90;
-    
-    BitStreamWriter bsw(1024);
-    
-    // Write PS Pack Header
-    PSPackHeader pack;
-    pack.system_clock_reference_base = dts - 3600;
-    pack.system_clock_reference_extension = 0;
-    pack.program_mux_rate = 6106;
-    pack.Encode(bsw);
-    
-    // Write System Header and PSM on first frame or IDR
+
+    uint64_t scr = dts * 90; // System Clock Reference
+    WritePackHeader(scr, 6106); // 6106 from Go code
+
     if (first_frame_ || idr_flag) {
-        system_->Encode(bsw);
-        psm_->Encode(bsw);
+        WriteSystemHeader();
+        WriteProgramStreamMap();
         first_frame_ = false;
     }
+
+    WritePesPacket(stream_id, data, size, pts * 90, dts * 90, idr_flag, with_aud, stream->stream_type);
+}
+
+void PSMuxer::WritePackHeader(uint64_t scr, uint32_t mux_rate) {
+    BitStreamWriter bsw(14);
+    bsw.PutByte(0x00); bsw.PutByte(0x00); bsw.PutByte(0x01); bsw.PutByte(0xBA);
+    bsw.PutUint8(1, 2); // '01'
+    bsw.PutUint64((scr >> 30) & 0x07, 3);
+    bsw.PutUint8(1, 1);
+    bsw.PutUint64((scr >> 15) & 0x7FFF, 15);
+    bsw.PutUint8(1, 1);
+    bsw.PutUint64(scr & 0x7FFF, 15);
+    bsw.PutUint8(1, 1);
+    bsw.PutUint16(0, 9); // extension
+    bsw.PutUint8(1, 1);
+    bsw.PutUint32(mux_rate, 22);
+    bsw.PutUint8(1, 1);
+    bsw.PutUint8(1, 1);
+    bsw.PutUint8(0x1F, 5); // reserved
+    bsw.PutUint8(0, 3); // stuffing length
     
-    // Write PES packets
-    auto frame_data = frame;
+    if (on_packet_) on_packet_(bsw.Bits());
+}
+
+void PSMuxer::WriteSystemHeader() {
+    BitStreamWriter bsw(64);
+    bsw.PutByte(0x00); bsw.PutByte(0x00); bsw.PutByte(0x01); bsw.PutByte(0xBB);
+    bsw.PutUint16(0, 16); // length placeholder
+    int loc = bsw.Size();
+    
+    bsw.PutUint8(1, 1);
+    bsw.PutUint32(system_header_.rate_bound, 22);
+    bsw.PutUint8(1, 1);
+    bsw.PutUint8(system_header_.audio_bound, 6);
+    bsw.PutUint8(0, 1); // fixed_flag
+    bsw.PutUint8(0, 1); // CSPS_flag
+    bsw.PutUint8(0, 1); // audio_lock
+    bsw.PutUint8(0, 1); // video_lock
+    bsw.PutUint8(1, 1);
+    bsw.PutUint8(system_header_.video_bound, 5);
+    bsw.PutUint8(0, 1); // restriction
+    bsw.PutUint8(0x7F, 7); // reserved
+    
+    for (const auto& stream : system_header_.streams) {
+        bsw.PutUint8(stream.stream_id, 8);
+        bsw.PutUint8(3, 2);
+        bsw.PutUint8(stream.p_std_buffer_bound_scale, 1);
+        bsw.PutUint16(stream.p_std_buffer_size_bound, 13);
+    }
+    
+    int length = bsw.Size() - loc;
+    bsw.SetUint16(length, loc - 2);
+    
+    if (on_packet_) on_packet_(bsw.Bits());
+}
+
+void PSMuxer::WriteProgramStreamMap() {
+    BitStreamWriter bsw(64);
+    bsw.PutByte(0x00); bsw.PutByte(0x00); bsw.PutByte(0x01); bsw.PutByte(0xBC);
+    bsw.PutUint16(0, 16); // length placeholder
+    int loc = bsw.Size();
+    
+    bsw.PutUint8(psm_.current_next_indicator, 1);
+    bsw.PutUint8(3, 2);
+    bsw.PutUint8(psm_.program_stream_map_version, 5);
+    bsw.PutUint8(0x7F, 7);
+    bsw.PutUint8(1, 1);
+    bsw.PutUint16(0, 16); // program_stream_info_length
+    
+    uint16_t es_map_len = psm_.stream_map.size() * 4;
+    bsw.PutUint16(es_map_len, 16);
+    
+    for (const auto& stream : psm_.stream_map) {
+        bsw.PutUint8(stream.stream_type, 8);
+        bsw.PutUint8(stream.elementary_stream_id, 8);
+        bsw.PutUint16(0, 16); // ES_info_length
+    }
+    
+    int length = bsw.Size() - loc + 4; // +4 for CRC
+    bsw.SetUint16(length, loc - 2);
+    
+    uint32_t crc = CalcCrc32(0xFFFFFFFF, bsw.Bits().data() + loc - 2 - 4, length - 4 + 4 + 2); 
+    // Wait, CRC calculation range is from packet_start_code_prefix? No.
+    // Go code: bsw.Bits()[bsw.ByteOffset()-int(length-4)-4:bsw.ByteOffset()]
+    // length includes CRC (4 bytes).
+    // Start is: ByteOffset - (length - 4) - 4.
+    // ByteOffset is current end.
+    // So it includes 00 00 01 BC? No.
+    // Go code: bsw.PutBytes([]byte{0x00, 0x00, 0x01, 0xBC}) ...
+    // The slice is from ... wait.
+    // Go code: bsw.Bits()[bsw.ByteOffset()-int(length-4)-4:bsw.ByteOffset()]
+    // length is value written to length field.
+    // length field is after 00 00 01 BC.
+    // So it includes 00 00 01 BC?
+    // 00 00 01 BC (4) + Length (2) + Data...
+    // Go code seems to include everything from 00 00 01 BC?
+    // Let's check Go code again.
+    // bsw.PutBytes([]byte{0x00, 0x00, 0x01, 0xBC})
+    // loc := bsw.ByteOffset()
+    // ...
+    // length := bsw.DistanceFromMarkDot()/8 + 4
+    // bsw.SetUint16(uint16(length), loc)
+    // crc := codec.CalcCrc32(0xffffffff, bsw.Bits()[bsw.ByteOffset()-int(length-4)-4:bsw.ByteOffset()])
+    // bsw.ByteOffset() is at the end (before CRC).
+    // length is (Data + CRC).
+    // length-4 is Data.
+    // So it starts at ByteOffset - Data - 4.
+    // 4 is 00 00 01 BC? No, 4 is Length field (2) + 00 00 01 BC (4)? No.
+    // The offset calculation is confusing.
+    // Let's assume it calculates CRC over the whole packet including start code?
+    // Standard says: CRC is calculated over the entire Program Stream Map.
+    // Program Stream Map starts with packet_start_code_prefix.
+    // So yes, from 00 00 01 BC.
+    
+    // My bsw.Bits() contains everything written so far.
+    // Start index is 0 (since I created new BSW).
+    // Length to calculate CRC on is bsw.Size().
+    crc = CalcCrc32(0xFFFFFFFF, bsw.Bits().data(), bsw.Size());
+    
+    bsw.PutByte(crc & 0xFF);
+    bsw.PutByte((crc >> 8) & 0xFF);
+    bsw.PutByte((crc >> 16) & 0xFF);
+    bsw.PutByte((crc >> 24) & 0xFF);
+    
+    if (on_packet_) on_packet_(bsw.Bits());
+}
+
+void PSMuxer::WritePesPacket(uint8_t stream_id, const uint8_t* data, size_t size, uint64_t pts, uint64_t dts, bool idr_flag, bool with_aud, uint8_t stream_type) {
+    BitStreamWriter bsw(1024);
+    size_t offset = 0;
     bool first = true;
-    
-    while (!frame_data.empty()) {
-        PesPacket pes_pkg;
-        pes_pkg.stream_id = sid;
-        pes_pkg.pts_dts_flags = 0x03;
-        pes_pkg.pes_header_data_length = 10;
-        pes_pkg.pts = pts;
-        pes_pkg.dts = dts;
+
+    while (offset < size) {
+        bsw.Reset();
         
-        if (idr_flag) {
-            pes_pkg.data_alignment_indicator = 1;
-        }
+        int pes_hdr_len = 13; // Start code (3) + StreamID (1) + Len (2) + Flags (2) + HdrLen (1) + PTS (5) + DTS (5)
+        // Actually:
+        // 00 00 01 (3)
+        // StreamID (1)
+        // Len (2)
+        // '10' (2 bits) + flags (6 bits) -> 1 byte
+        // PTS_DTS_flags (2 bits) + ... -> 1 byte
+        // PES_header_data_length (1 byte)
+        // PTS (5)
+        // DTS (5)
+        // Total: 3 + 1 + 2 + 1 + 1 + 1 + 5 + 5 = 19 bytes.
+        // Go code says peshdrlen := 13.
+        // Wait, Go code:
+        // pespkg.PTS_DTS_flags = 0x03
+        // pespkg.PES_header_data_length = 10
+        // pespkg.Encode(bsw)
+        // Encode does:
+        // 00 00 01 StreamID
+        // Len
+        // '10' ...
+        // PTS/DTS
+        // So header size is indeed 19 bytes if PTS/DTS present.
+        // Go code: peshdrlen := 13.
+        // Maybe it means 13 bytes AFTER the first 6 bytes?
+        // 13 = 3 (Flags+Len) + 10 (PTS/DTS).
+        // Total 6 + 13 = 19.
         
-        size_t pes_hdr_len = 13;
-        
-        // Add AUD if needed
-        if (first && !with_aud && vcl) {
-            if (stream_type == PSStreamType::H264) {
-                pes_pkg.pes_payload.insert(pes_pkg.pes_payload.end(), 
-                                          H264_AUD_NALU, 
-                                          H264_AUD_NALU + H264_AUD_NALU_SIZE);
-                pes_hdr_len += H264_AUD_NALU_SIZE;
-            } else if (stream_type == PSStreamType::H265) {
-                pes_pkg.pes_payload.insert(pes_pkg.pes_payload.end(),
-                                          H265_AUD_NALU,
-                                          H265_AUD_NALU + H265_AUD_NALU_SIZE);
-                pes_hdr_len += H265_AUD_NALU_SIZE;
+        std::vector<uint8_t> payload_prefix;
+        if (first && !with_aud) {
+            if (stream_type == PS_STREAM_H264) {
+                payload_prefix = {0x00, 0x00, 0x00, 0x01, 0x09, 0xF0};
+            } else if (stream_type == PS_STREAM_H265) {
+                payload_prefix = {0x00, 0x00, 0x00, 0x01, 0x46, 0x01, 0x50};
             }
         }
         
-        // Split large frames
-        if (pes_hdr_len + frame_data.size() >= 0xFFFF) {
-            pes_pkg.pes_packet_length = 0xFFFF;
-            size_t payload_size = 0xFFFF - pes_hdr_len;
-            pes_pkg.pes_payload.insert(pes_pkg.pes_payload.end(),
-                                       frame_data.begin(),
-                                       frame_data.begin() + payload_size);
-            frame_data.erase(frame_data.begin(), frame_data.begin() + payload_size);
-        } else {
-            pes_pkg.pes_packet_length = pes_hdr_len + frame_data.size();
-            pes_pkg.pes_payload.insert(pes_pkg.pes_payload.end(),
-                                       frame_data.begin(),
-                                       frame_data.end());
-            frame_data.clear();
+        size_t max_payload = 0xFFFF - 19 - payload_prefix.size(); // Max PES packet size 65535
+        size_t to_write = std::min(size - offset, max_payload);
+        
+        // Write PES Header
+        bsw.PutByte(0x00); bsw.PutByte(0x00); bsw.PutByte(0x01);
+        bsw.PutByte(stream_id);
+        
+        size_t packet_len = 13 + payload_prefix.size() + to_write; // 13 is header size excluding first 6 bytes
+        if (packet_len > 0xFFFF) packet_len = 0xFFFF; // Should not happen with calculation above
+        
+        bsw.PutUint16(packet_len, 16);
+        
+        bsw.PutUint8(0x02, 2); // '10'
+        bsw.PutUint8(0, 2);
+        bsw.PutUint8(0, 1);
+        bsw.PutUint8(idr_flag ? 1 : 0, 1); // data_alignment
+        bsw.PutUint8(0, 1);
+        bsw.PutUint8(0, 1);
+        
+        bsw.PutUint8(0x03, 2); // PTS_DTS
+        bsw.PutUint8(0, 1);
+        bsw.PutUint8(0, 1);
+        bsw.PutUint8(0, 1);
+        bsw.PutUint8(0, 1);
+        bsw.PutUint8(0, 1);
+        bsw.PutUint8(0, 1);
+        
+        bsw.PutByte(10); // header data length
+        
+        // PTS
+        bsw.PutUint8(0x03, 4);
+        bsw.PutUint8((pts >> 30) & 0x07, 3);
+        bsw.PutUint8(1, 1);
+        bsw.PutUint16((pts >> 15) & 0x7FFF, 15);
+        bsw.PutUint8(1, 1);
+        bsw.PutUint16(pts & 0x7FFF, 15);
+        bsw.PutUint8(1, 1);
+        
+        // DTS
+        bsw.PutUint8(0x01, 4);
+        bsw.PutUint8((dts >> 30) & 0x07, 3);
+        bsw.PutUint8(1, 1);
+        bsw.PutUint16((dts >> 15) & 0x7FFF, 15);
+        bsw.PutUint8(1, 1);
+        bsw.PutUint16(dts & 0x7FFF, 15);
+        bsw.PutUint8(1, 1);
+        
+        if (!payload_prefix.empty()) {
+            bsw.PutBytes(payload_prefix.data(), payload_prefix.size());
         }
         
-        pes_pkg.Encode(bsw);
+        bsw.PutBytes(data + offset, to_write);
+        offset += to_write;
         
-        if (on_packet_) {
-            on_packet_(bsw.Bits());
-        }
+        if (on_packet_) on_packet_(bsw.Bits());
         
-        bsw.Reset();
         first = false;
     }
-    
-    return static_cast<int>(Mpeg2Error::SUCCESS);
 }
 
 } // namespace mpeg2
