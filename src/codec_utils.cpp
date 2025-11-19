@@ -18,7 +18,7 @@ static int FindStartCode(const uint8_t* data, size_t size, int* start_code_len) 
     return -1;
 }
 
-void H264Utils::SplitFrame(const uint8_t* data, size_t size, std::function<bool(const uint8_t* nalu, size_t len)> on_nalu) {
+void CodecUtils::SplitFrame(const uint8_t* data, size_t size, std::function<bool(const uint8_t* nalu, size_t len)> on_nalu) {
     int start_code_len = 0;
     int pos = FindStartCode(data, size, &start_code_len);
     while (pos != -1) {
@@ -45,27 +45,27 @@ void H264Utils::SplitFrame(const uint8_t* data, size_t size, std::function<bool(
     }
 }
 
-int H264Utils::GetNaluType(const uint8_t* nalu, size_t len) {
+int CodecUtils::GetNaluType(const uint8_t* nalu, size_t len) {
     if (len == 0) return H264_NAL_UNKNOWN;
     return nalu[0] & 0x1F;
 }
 
-bool H264Utils::IsH264IDR(const uint8_t* nalu, size_t len) {
+bool CodecUtils::IsH264IDR(const uint8_t* nalu, size_t len) {
     int type = GetNaluType(nalu, len);
     return type == H264_NAL_IDR_SLICE;
 }
 
-bool H264Utils::IsH264AUD(const uint8_t* nalu, size_t len) {
+bool CodecUtils::IsH264AUD(const uint8_t* nalu, size_t len) {
     int type = GetNaluType(nalu, len);
     return type == H264_NAL_AUD;
 }
 
-bool H264Utils::IsH264VCL(const uint8_t* nalu, size_t len) {
+bool CodecUtils::IsH264VCL(const uint8_t* nalu, size_t len) {
     int type = GetNaluType(nalu, len);
     return type >= 1 && type <= 5;
 }
 
-bool H264Utils::IsH264FirstSlice(const uint8_t* nalu, size_t len) {
+bool CodecUtils::IsH264FirstSlice(const uint8_t* nalu, size_t len) {
     if (!IsH264VCL(nalu, len)) return false;
     // Skip NALU header (1 byte)
     if (len < 2) return false;
@@ -75,28 +75,28 @@ bool H264Utils::IsH264FirstSlice(const uint8_t* nalu, size_t len) {
     return first_mb == 0;
 }
 
-int H264Utils::GetH265NaluType(const uint8_t* nalu, size_t len) {
+int CodecUtils::GetH265NaluType(const uint8_t* nalu, size_t len) {
     if (len == 0) return -1;
     return (nalu[0] >> 1) & 0x3F;
 }
 
-bool H264Utils::IsH265IDR(const uint8_t* nalu, size_t len) {
+bool CodecUtils::IsH265IDR(const uint8_t* nalu, size_t len) {
     int type = GetH265NaluType(nalu, len);
     return type == H265_NAL_IDR_W_RADL || type == H265_NAL_IDR_N_LP || type == H265_NAL_BLA_W_LP ||
            type == H265_NAL_BLA_W_RADL || type == H265_NAL_BLA_N_LP || type == H265_NAL_CRA_NUT;
 }
 
-bool H264Utils::IsH265AUD(const uint8_t* nalu, size_t len) {
+bool CodecUtils::IsH265AUD(const uint8_t* nalu, size_t len) {
     int type = GetH265NaluType(nalu, len);
     return type == H265_NAL_AUD;
 }
 
-bool H264Utils::IsH265VCL(const uint8_t* nalu, size_t len) {
+bool CodecUtils::IsH265VCL(const uint8_t* nalu, size_t len) {
     int type = GetH265NaluType(nalu, len);
     return type >= 0 && type <= 31;
 }
 
-bool H264Utils::IsH265FirstSlice(const uint8_t* nalu, size_t len) {
+bool CodecUtils::IsH265FirstSlice(const uint8_t* nalu, size_t len) {
     if (!IsH265VCL(nalu, len)) return false;
     // Skip NALU header (2 bytes)
     if (len < 3) return false;

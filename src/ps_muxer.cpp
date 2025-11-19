@@ -69,13 +69,13 @@ void PSMuxer::Write(uint8_t stream_id, const uint8_t* data, size_t size, uint64_
     bool vcl = false;
 
     if (stream->stream_type == PS_STREAM_H264) {
-        H264Utils::SplitFrame(data, size, [&](const uint8_t* nalu, size_t len) {
-            if (H264Utils::IsH264AUD(nalu, len)) {
+        CodecUtils::SplitFrame(data, size, [&](const uint8_t* nalu, size_t len) {
+            if (CodecUtils::IsH264AUD(nalu, len)) {
                 with_aud = true;
                 return false;
             }
-            if (H264Utils::IsH264VCL(nalu, len)) {
-                if (H264Utils::IsH264IDR(nalu, len)) {
+            if (CodecUtils::IsH264VCL(nalu, len)) {
+                if (CodecUtils::IsH264IDR(nalu, len)) {
                     idr_flag = true;
                 }
                 vcl = true;
@@ -84,13 +84,13 @@ void PSMuxer::Write(uint8_t stream_id, const uint8_t* data, size_t size, uint64_
             return true;
         });
     } else if (stream->stream_type == PS_STREAM_H265) {
-        H264Utils::SplitFrame(data, size, [&](const uint8_t* nalu, size_t len) {
-            if (H264Utils::IsH265AUD(nalu, len)) {
+        CodecUtils::SplitFrame(data, size, [&](const uint8_t* nalu, size_t len) {
+            if (CodecUtils::IsH265AUD(nalu, len)) {
                 with_aud = true;
                 return false;
             }
-            if (H264Utils::IsH265VCL(nalu, len)) {
-                if (H264Utils::IsH265IDR(nalu, len)) {
+            if (CodecUtils::IsH265VCL(nalu, len)) {
+                if (CodecUtils::IsH265IDR(nalu, len)) {
                     idr_flag = true;
                 }
                 vcl = true;

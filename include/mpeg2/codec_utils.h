@@ -55,7 +55,7 @@ enum H265_NAL_TYPE {
     H265_NAL_SEI_SUFFIX = 40,
 };
 
-class H264Utils {
+class CodecUtils {
 public:
     // Callback returns true to continue, false to stop
     static void SplitFrame(const uint8_t* data, size_t size, std::function<bool(const uint8_t* nalu, size_t len)> on_nalu);

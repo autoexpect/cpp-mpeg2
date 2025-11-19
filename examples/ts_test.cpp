@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> au_buffer;
     bool has_vcl = false;
 
-    H264Utils::SplitFrame(buffer.data(), size, [&](const uint8_t* nalu, size_t len) {
+    CodecUtils::SplitFrame(buffer.data(), size, [&](const uint8_t* nalu, size_t len) {
         bool new_au = false;
         bool is_vcl = false;
         bool is_aud = false;
@@ -74,10 +74,10 @@ int main(int argc, char** argv) {
         static bool au_has_pps = false;
 
         if (is_h265) {
-            int type = H264Utils::GetH265NaluType(nalu, len);
-            is_vcl = H264Utils::IsH265VCL(nalu, len);
-            is_aud = H264Utils::IsH265AUD(nalu, len);
-            is_idr = H264Utils::IsH265IDR(nalu, len);
+            int type = CodecUtils::GetH265NaluType(nalu, len);
+            is_vcl = CodecUtils::IsH265VCL(nalu, len);
+            is_aud = CodecUtils::IsH265AUD(nalu, len);
+            is_idr = CodecUtils::IsH265IDR(nalu, len);
 
             if (type == H265_NAL_VPS) {
                 last_vps.assign(nalu, nalu + len);
@@ -100,16 +100,16 @@ int main(int argc, char** argv) {
             if (is_vcl) {
                 if (has_vcl) {
                     // Check if it is the first slice of a new picture
-                    if (H264Utils::IsH265FirstSlice(nalu, len)) {
+                    if (CodecUtils::IsH265FirstSlice(nalu, len)) {
                         new_au = true;
                     }
                 }
             }
         } else {
-            int type = H264Utils::GetNaluType(nalu, len);
-            is_vcl = H264Utils::IsH264VCL(nalu, len);
-            is_aud = H264Utils::IsH264AUD(nalu, len);
-            is_idr = H264Utils::IsH264IDR(nalu, len);
+            int type = CodecUtils::GetNaluType(nalu, len);
+            is_vcl = CodecUtils::IsH264VCL(nalu, len);
+            is_aud = CodecUtils::IsH264AUD(nalu, len);
+            is_idr = CodecUtils::IsH264IDR(nalu, len);
 
             if (type == H264_NAL_SPS) {
                 last_sps.assign(nalu, nalu + len);
@@ -128,7 +128,7 @@ int main(int argc, char** argv) {
             if (is_vcl) {
                 if (has_vcl) {
                     // Check if it is the first slice of a new picture
-                    if (H264Utils::IsH264FirstSlice(nalu, len)) {
+                    if (CodecUtils::IsH264FirstSlice(nalu, len)) {
                         new_au = true;
                     }
                 }
