@@ -61,12 +61,35 @@ int main(int argc, char** argv) {
         bool is_vcl = false;
         bool is_aud = false;
         bool is_sps_pps = false;
+        bool is_idr = false;
+
+        // Cache for parameter sets
+        static std::vector<uint8_t> last_vps;
+        static std::vector<uint8_t> last_sps;
+        static std::vector<uint8_t> last_pps;
+        
+        // Flags for current AU
+        static bool au_has_vps = false;
+        static bool au_has_sps = false;
+        static bool au_has_pps = false;
 
         if (is_h265) {
             int type = H264Utils::GetH265NaluType(nalu, len);
             is_vcl = H264Utils::IsH265VCL(nalu, len);
             is_aud = H264Utils::IsH265AUD(nalu, len);
-            if (type == H265_NAL_VPS || type == H265_NAL_SPS || type == H265_NAL_PPS) {
+            is_idr = H264Utils::IsH265IDR(nalu, len);
+
+            if (type == H265_NAL_VPS) {
+                last_vps.assign(nalu, nalu + len);
+                au_has_vps = true;
+                is_sps_pps = true;
+            } else if (type == H265_NAL_SPS) {
+                last_sps.assign(nalu, nalu + len);
+                au_has_sps = true;
+                is_sps_pps = true;
+            } else if (type == H265_NAL_PPS) {
+                last_pps.assign(nalu, nalu + len);
+                au_has_pps = true;
                 is_sps_pps = true;
             }
             
@@ -86,7 +109,15 @@ int main(int argc, char** argv) {
             int type = H264Utils::GetNaluType(nalu, len);
             is_vcl = H264Utils::IsH264VCL(nalu, len);
             is_aud = H264Utils::IsH264AUD(nalu, len);
-            if (type == H264_NAL_SPS || type == H264_NAL_PPS) {
+            is_idr = H264Utils::IsH264IDR(nalu, len);
+
+            if (type == H264_NAL_SPS) {
+                last_sps.assign(nalu, nalu + len);
+                au_has_sps = true;
+                is_sps_pps = true;
+            } else if (type == H264_NAL_PPS) {
+                last_pps.assign(nalu, nalu + len);
+                au_has_pps = true;
                 is_sps_pps = true;
             }
 
@@ -110,6 +141,32 @@ int main(int argc, char** argv) {
             dts += interval;
             au_buffer.clear();
             has_vcl = false;
+            
+            // Reset AU flags for new AU
+            au_has_vps = false;
+            au_has_sps = false;
+            au_has_pps = false;
+        }
+
+        // If this is an IDR frame, check if we need to insert parameter sets
+        if (is_idr) {
+            if (is_h265) {
+                if (!au_has_vps && !last_vps.empty()) {
+                    au_buffer.push_back(0x00); au_buffer.push_back(0x00); au_buffer.push_back(0x00); au_buffer.push_back(0x01);
+                    au_buffer.insert(au_buffer.end(), last_vps.begin(), last_vps.end());
+                    au_has_vps = true;
+                }
+            }
+            if (!au_has_sps && !last_sps.empty()) {
+                au_buffer.push_back(0x00); au_buffer.push_back(0x00); au_buffer.push_back(0x00); au_buffer.push_back(0x01);
+                au_buffer.insert(au_buffer.end(), last_sps.begin(), last_sps.end());
+                au_has_sps = true;
+            }
+            if (!au_has_pps && !last_pps.empty()) {
+                au_buffer.push_back(0x00); au_buffer.push_back(0x00); au_buffer.push_back(0x00); au_buffer.push_back(0x01);
+                au_buffer.insert(au_buffer.end(), last_pps.begin(), last_pps.end());
+                au_has_pps = true;
+            }
         }
 
         au_buffer.push_back(0x00);
