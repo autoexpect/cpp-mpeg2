@@ -10,9 +10,9 @@
 namespace mpeg2 {
 
 struct PmtStream {
-    uint8_t stream_type;
-    uint16_t pid;
-    uint8_t cc; // Continuity counter for this stream
+    uint8_t stream_type = 0;
+    uint16_t pid = 0;
+    uint8_t cc = 0; // Continuity counter for this stream
 };
 
 struct Pmt {

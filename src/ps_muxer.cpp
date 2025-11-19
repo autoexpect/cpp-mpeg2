@@ -1,5 +1,5 @@
 #include "mpeg2/ps_muxer.h"
-#include "mpeg2/utils.h"
+#include "mpeg2/crc32.hpp"
 #include "mpeg2/codec_utils.h"
 #include <iostream>
 
@@ -190,7 +190,7 @@ void PSMuxer::WriteProgramStreamMap() {
     int length = bsw.Size() - loc + 4; // +4 for CRC
     bsw.SetUint16(length, loc - 2);
     
-    uint32_t crc = CalcCrc32(0xFFFFFFFF, bsw.Bits().data() + loc - 2 - 4, length - 4 + 4 + 2); 
+    uint32_t crc = crc32<IEEE8023_CRC32_POLYNOMIAL>(0xFFFFFFFF, bsw.Bits().data() + loc - 2 - 4, length - 4 + 4 + 2); 
     // Wait, CRC calculation range is from packet_start_code_prefix? No.
     // Go code: bsw.Bits()[bsw.ByteOffset()-int(length-4)-4:bsw.ByteOffset()]
     // length includes CRC (4 bytes).
@@ -226,7 +226,7 @@ void PSMuxer::WriteProgramStreamMap() {
     // My bsw.Bits() contains everything written so far.
     // Start index is 0 (since I created new BSW).
     // Length to calculate CRC on is bsw.Size().
-    crc = CalcCrc32(0xFFFFFFFF, bsw.Bits().data(), bsw.Size());
+    crc = crc32<IEEE8023_CRC32_POLYNOMIAL>(0xFFFFFFFF, bsw.Bits().data(), bsw.Size());
     
     bsw.PutByte(crc & 0xFF);
     bsw.PutByte((crc >> 8) & 0xFF);

@@ -1,5 +1,5 @@
 #include "mpeg2/ts_muxer.h"
-#include "mpeg2/utils.h"
+#include "mpeg2/crc32.hpp"
 #include "mpeg2/codec_utils.h"
 #include <iostream>
 
@@ -153,11 +153,16 @@ void TSMuxer::WritePat() {
     int section_length = bsw.Size() - section_start + 4; // +4 for CRC
     bsw.SetUint16((section_length & 0x0FFF) | (1 << 15) | 0x3000, loc);
     
-    uint32_t crc = CalcCrc32(0xFFFFFFFF, bsw.Bits().data() + section_start - 3, section_length - 4 + 3);
-    bsw.PutByte(crc & 0xFF);
-    bsw.PutByte((crc >> 8) & 0xFF);
-    bsw.PutByte((crc >> 16) & 0xFF);
+    // CRC starts from table_id (loc - 1) and covers the entire section except CRC itself
+    int crc_start = loc - 1;  // table_id position
+    int crc_len = bsw.Size() - crc_start;
+    uint32_t crc = crc32<IEEE8023_CRC32_POLYNOMIAL>(0xFFFFFFFF, bsw.Bits().data() + crc_start, crc_len);
+    
+    // Write CRC in big-endian order (MSB first)
     bsw.PutByte((crc >> 24) & 0xFF);
+    bsw.PutByte((crc >> 16) & 0xFF);
+    bsw.PutByte((crc >> 8) & 0xFF);
+    bsw.PutByte(crc & 0xFF);
 
     bsw.FillRemainData(0xFF);
     if (on_packet_) {
@@ -213,11 +218,16 @@ void TSMuxer::WritePmt(Pmt& pmt) {
     int section_length = bsw.Size() - section_start + 4;
     bsw.SetUint16((section_length & 0x0FFF) | (1 << 15) | 0x3000, loc);
 
-    uint32_t crc = CalcCrc32(0xFFFFFFFF, bsw.Bits().data() + section_start - 3, section_length - 4 + 3);
-    bsw.PutByte(crc & 0xFF);
-    bsw.PutByte((crc >> 8) & 0xFF);
-    bsw.PutByte((crc >> 16) & 0xFF);
+    // CRC starts from table_id (loc - 1) and covers the entire section except CRC itself
+    int crc_start = loc - 1;  // table_id position
+    int crc_len = bsw.Size() - crc_start;
+    uint32_t crc = crc32<IEEE8023_CRC32_POLYNOMIAL>(0xFFFFFFFF, bsw.Bits().data() + crc_start, crc_len);
+    
+    // Write CRC in big-endian order (MSB first)
     bsw.PutByte((crc >> 24) & 0xFF);
+    bsw.PutByte((crc >> 16) & 0xFF);
+    bsw.PutByte((crc >> 8) & 0xFF);
+    bsw.PutByte(crc & 0xFF);
 
     bsw.FillRemainData(0xFF);
     if (on_packet_) {
