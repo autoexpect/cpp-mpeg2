@@ -2,6 +2,7 @@
 #define MPEG2_CODEC_UTILS_H
 
 #include <cstdint>
+#include <cstddef>
 #include <vector>
 #include <functional>
 
