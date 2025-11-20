@@ -5,7 +5,7 @@ AR ?= ar
 CXXFLAGS = -std=c++11 -Iinclude -Wall -g
 LDFLAGS = 
 
-SRCS = src/bitstream.cpp src/ts_muxer.cpp src/ps_muxer.cpp src/codec_utils.cpp
+SRCS = src/bitstream.cpp src/ts_muxer.cpp src/ps_muxer.cpp src/codec_utils.cpp src/aac_utils.cpp
 OBJS = $(SRCS:.cpp=.o)
 
 TARGET_LIB = libmpeg2.a

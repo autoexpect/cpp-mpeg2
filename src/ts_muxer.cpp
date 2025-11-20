@@ -342,6 +342,13 @@ void TSMuxer::WritePes(PmtStream& stream, Pmt& pmt, const uint8_t* data, size_t 
             
             uint16_t pes_packet_len = 0;
             size_t total_data_len = size + payload.size();
+
+            int header_data_len = 5; // PTS only
+            int flags_len = 3; // Flags (2) + Header Length (1)
+            if (pts != dts) {
+                header_data_len = 10; // PTS + DTS
+            }
+
             // If video, can be 0 if too large? Go code says: if headlen-oldheadlen-6+len(data) > 0xFFFF -> 0
             // But here we are calculating PES packet length field.
             // For video, if length > 0xFFFF, set to 0.
@@ -352,10 +359,10 @@ void TSMuxer::WritePes(PmtStream& stream, Pmt& pmt, const uint8_t* data, size_t 
             if (stream.stream_type == TS_STREAM_H264 || stream.stream_type == TS_STREAM_H265) {
                  pes_packet_len = 0;
             } else {
-                 if (total_data_len + 3 + 5 + 5 > 0xFFFF) {
+                 if (total_data_len + flags_len + header_data_len > 0xFFFF) {
                      pes_packet_len = 0;
                  } else {
-                     pes_packet_len = total_data_len + 13;
+                     pes_packet_len = total_data_len + flags_len + header_data_len;
                  }
             }
             pes_hdr.PutUint16(pes_packet_len, 16);
@@ -367,7 +374,11 @@ void TSMuxer::WritePes(PmtStream& stream, Pmt& pmt, const uint8_t* data, size_t 
             pes_hdr.PutUint8(0, 1); // Copyright
             pes_hdr.PutUint8(0, 1); // Original
             
-            pes_hdr.PutUint8(0x03, 2); // PTS_DTS_flags = '11'
+            if (pts != dts) {
+                pes_hdr.PutUint8(0x03, 2); // PTS_DTS_flags = '11'
+            } else {
+                pes_hdr.PutUint8(0x02, 2); // PTS_DTS_flags = '10'
+            }
             pes_hdr.PutUint8(0, 1); // ESCR flag
             pes_hdr.PutUint8(0, 1); // ES rate flag
             pes_hdr.PutUint8(0, 1); // DSM trick mode flag
@@ -375,10 +386,14 @@ void TSMuxer::WritePes(PmtStream& stream, Pmt& pmt, const uint8_t* data, size_t 
             pes_hdr.PutUint8(0, 1); // CRC flag
             pes_hdr.PutUint8(0, 1); // Extension flag
             
-            pes_hdr.PutByte(10); // PES_header_data_length
+            pes_hdr.PutByte(header_data_len); // PES_header_data_length
             
             // PTS
-            pes_hdr.PutUint8(0x03, 4); // '0011'
+            if (pts != dts) {
+                pes_hdr.PutUint8(0x03, 4); // '0011'
+            } else {
+                pes_hdr.PutUint8(0x02, 4); // '0010'
+            }
             pes_hdr.PutUint8((pts >> 30) & 0x07, 3);
             pes_hdr.PutUint8(1, 1);
             pes_hdr.PutUint16((pts >> 15) & 0x7FFF, 15);
@@ -387,17 +402,19 @@ void TSMuxer::WritePes(PmtStream& stream, Pmt& pmt, const uint8_t* data, size_t 
             pes_hdr.PutUint8(1, 1);
             
             // DTS
-            pes_hdr.PutUint8(0x01, 4); // '0001'
-            pes_hdr.PutUint8((dts >> 30) & 0x07, 3);
-            pes_hdr.PutUint8(1, 1);
-            pes_hdr.PutUint16((dts >> 15) & 0x7FFF, 15);
-            pes_hdr.PutUint8(1, 1);
-            pes_hdr.PutUint16(dts & 0x7FFF, 15);
-            pes_hdr.PutUint8(1, 1);
+            if (pts != dts) {
+                pes_hdr.PutUint8(0x01, 4); // '0001'
+                pes_hdr.PutUint8((dts >> 30) & 0x07, 3);
+                pes_hdr.PutUint8(1, 1);
+                pes_hdr.PutUint16((dts >> 15) & 0x7FFF, 15);
+                pes_hdr.PutUint8(1, 1);
+                pes_hdr.PutUint16(dts & 0x7FFF, 15);
+                pes_hdr.PutUint8(1, 1);
+            }
             
             // Add PES header to payload
-            std::vector<uint8_t> pes_hdr_bytes = pes_hdr.Bits();
-            payload.insert(payload.begin(), pes_hdr_bytes.begin(), pes_hdr_bytes.end());
+            const std::vector<uint8_t>& pes_hdr_bytes = pes_hdr.Bits();
+            payload.insert(payload.begin(), pes_hdr_bytes.begin(), pes_hdr_bytes.begin() + pes_hdr.Size());
         }
         
         // Now we have payload (PES header + AUD + data chunk)

@@ -1,11 +1,22 @@
 #include "mpeg2/ts_muxer.h"
 #include "mpeg2/codec_utils.h"
+#include "mpeg2/aac_utils.h"
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <cstring>
 
 using namespace mpeg2;
+
+bool read_file(const std::string& path, std::string& content) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) return false;
+    size_t size = in.tellg();
+    in.seekg(0, std::ios::beg);
+    content.resize(size);
+    in.read(&content[0], size);
+    return true;
+}
 
 int main(int argc, char** argv) {
     if (argc < 3) {
@@ -26,15 +37,37 @@ int main(int argc, char** argv) {
         interval = std::stoi(argv[3]);
     }
 
+    std::string aac_file = "test.aac";
+    if (argc >= 5) {
+        aac_file = argv[4];
+    }
+
+    std::string aac_content;
+    if (!read_file(aac_file, aac_content)) {
+        std::cerr << "Failed to read " << aac_file << std::endl;
+        // return -1; // Don't fail if audio file missing, just skip audio? Or fail?
+        // User request says "use parameter to pass in", implying they want to test it.
+        // So failing is appropriate if they specified it or if we rely on it.
+        return -1;
+    }
+
+    std::vector<std::string> aac_frames;
+    mpeg2::SplitAACFrame((const uint8_t*)aac_content.data(), aac_content.size(), [&](const uint8_t* data, int size) {
+        aac_frames.push_back(std::string((const char*)data, size));
+    });
+
+    std::cout << "AAC frames: " << aac_frames.size() << std::endl;
+
+    TSMuxer muxer;
+    uint16_t video_pid = muxer.AddStream(is_h265 ? TS_STREAM_H265 : TS_STREAM_H264);
+    uint16_t audio_pid = muxer.AddStream(mpeg2::TS_STREAM_AAC);
+
     std::ofstream out(output_file, std::ios::binary);
     if (!out) {
         std::cerr << "Failed to open output file" << std::endl;
         return 1;
     }
 
-    TSMuxer muxer;
-    uint16_t pid = muxer.AddStream(is_h265 ? TS_STREAM_H265 : TS_STREAM_H264);
-    
     muxer.SetOnPacket([&](const std::vector<uint8_t>& packet) {
         out.write((const char*)packet.data(), packet.size());
     });
@@ -53,6 +86,9 @@ int main(int argc, char** argv) {
     uint64_t pts = 0;
     uint64_t dts = 0;
     
+    uint64_t audio_pts = 0;
+    size_t aac_idx = 0;
+
     std::vector<uint8_t> au_buffer;
     bool has_vcl = false;
 
@@ -136,9 +172,18 @@ int main(int argc, char** argv) {
         }
 
         if (new_au && !au_buffer.empty()) {
-            muxer.Write(pid, au_buffer.data(), au_buffer.size(), pts, dts);
-            pts += interval;
-            dts += interval;
+            muxer.Write(video_pid, au_buffer.data(), au_buffer.size(), pts, dts);
+            
+            // Write Audio frames to catch up
+            while (audio_pts < pts && aac_idx < aac_frames.size()) {
+                muxer.Write(audio_pid, (const uint8_t*)aac_frames[aac_idx].data(), aac_frames[aac_idx].size(), audio_pts, audio_pts);
+                audio_pts += (1024 * 90000) / 44100;
+                aac_idx++;
+            }
+            if (aac_idx >= aac_frames.size()) aac_idx = 0; // Loop audio
+
+            pts += interval * 90; // interval is in ms, pts is 90kHz. 1ms = 90 ticks.
+            dts += interval * 90;
             au_buffer.clear();
             has_vcl = false;
             
@@ -180,7 +225,7 @@ int main(int argc, char** argv) {
     });
 
     if (!au_buffer.empty()) {
-        muxer.Write(pid, au_buffer.data(), au_buffer.size(), pts, dts);
+        muxer.Write(video_pid, au_buffer.data(), au_buffer.size(), pts, dts);
     }
 
     return 0;
