@@ -1,11 +1,22 @@
 #include "mpeg2/ps_muxer.h"
 #include "mpeg2/codec_utils.h"
+#include "mpeg2/aac_utils.h"
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <cstring>
 
 using namespace mpeg2;
+
+bool read_file(const std::string& path, std::string& content) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) return false;
+    size_t size = in.tellg();
+    in.seekg(0, std::ios::beg);
+    content.resize(size);
+    in.read(&content[0], size);
+    return true;
+}
 
 int main(int argc, char** argv) {
     if (argc < 3) {
@@ -26,6 +37,24 @@ int main(int argc, char** argv) {
         interval = std::stoi(argv[3]);
     }
 
+    std::string aac_file = "test.aac";
+    if (argc >= 5) {
+        aac_file = argv[4];
+    }
+
+    std::string aac_content;
+    if (!read_file(aac_file, aac_content)) {
+        std::cerr << "Failed to read " << aac_file << std::endl;
+        return -1;
+    }
+
+    std::vector<std::string> aac_frames;
+    mpeg2::SplitAACFrame((const uint8_t*)aac_content.data(), aac_content.size(), [&](const uint8_t* data, int size) {
+        aac_frames.push_back(std::string((const char*)data, size));
+    });
+
+    std::cout << "AAC frames: " << aac_frames.size() << std::endl;
+
     std::ofstream out(output_file, std::ios::binary);
     if (!out) {
         std::cerr << "Failed to open output file" << std::endl;
@@ -34,6 +63,7 @@ int main(int argc, char** argv) {
 
     PSMuxer muxer;
     uint8_t stream_id = muxer.AddStream(is_h265 ? PS_STREAM_H265 : PS_STREAM_H264);
+    uint8_t audio_stream_id = muxer.AddStream(mpeg2::PS_STREAM_AAC);
     
     muxer.SetOnPacket([&](const std::vector<uint8_t>& packet) {
         out.write((const char*)packet.data(), packet.size());
@@ -52,6 +82,9 @@ int main(int argc, char** argv) {
 
     uint64_t pts = 0;
     uint64_t dts = 0;
+    
+    uint64_t audio_pts = 0;
+    size_t aac_idx = 0;
     
     std::vector<uint8_t> au_buffer;
     bool has_vcl = false;
@@ -137,6 +170,14 @@ int main(int argc, char** argv) {
 
         if (new_au && !au_buffer.empty()) {
             muxer.Write(stream_id, au_buffer.data(), au_buffer.size(), pts, dts);
+
+            // Write Audio frames to catch up
+            while (audio_pts < pts && aac_idx < aac_frames.size()) {
+                muxer.Write(audio_stream_id, (const uint8_t*)aac_frames[aac_idx].data(), aac_frames[aac_idx].size(), audio_pts, audio_pts);
+                audio_pts += (1024 * 90000) / 44100;
+                aac_idx++;
+            }
+            if (aac_idx >= aac_frames.size()) aac_idx = 0; // Loop audio
             pts += interval;
             dts += interval;
             au_buffer.clear();
