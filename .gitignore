@@ -1,10 +1,7 @@
 build
 gomedia
 
-ps_test
 ts_test
-aac_ps_test
-aac_ts_test
 
 *.o
 *.a

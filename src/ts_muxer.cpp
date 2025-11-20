@@ -432,12 +432,6 @@ void TSMuxer::WritePes(PmtStream& stream, Pmt& pmt, const uint8_t* data, size_t 
         // But we have two sources of data: `payload` (header/AUD) and `data` (frame).
         // We consume `payload` first, then `data`.
         
-        int payload_written = 0;
-        int data_written = 0;
-        
-        // Total bytes to write in this packet
-        int bytes_to_write = 0;
-        
         // Stuffing logic
         size_t remaining_payload = payload.size();
         size_t remaining_data = size - offset;

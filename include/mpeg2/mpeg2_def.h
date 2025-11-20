@@ -21,15 +21,6 @@ enum TS_STREAM_TYPE {
     TS_STREAM_H265 = 0x24
 };
 
-enum PS_STREAM_TYPE {
-    PS_STREAM_UNKNOW = 0xFF,
-    PS_STREAM_AAC = 0x0F,
-    PS_STREAM_H264 = 0x1B,
-    PS_STREAM_H265 = 0x24,
-    PS_STREAM_G711A = 0x90,
-    PS_STREAM_G711U = 0x91
-};
-
 const int TS_PACKET_SIZE = 188;
 
 } // namespace mpeg2
