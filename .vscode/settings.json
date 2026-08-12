@@ -1,3 +1,7 @@
 {
-    "makefile.configureOnOpen": false
+    "clangd.arguments": [
+        "--query-driver=/usr/bin/g++",
+        "-I${workspaceFolder}/include/mpeg2"
+    ],
+    "clangd.path": "/usr/bin/clangd"
 }

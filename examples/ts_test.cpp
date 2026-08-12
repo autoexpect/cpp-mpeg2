@@ -1,16 +1,19 @@
-#include "mpeg2/ts_muxer.h"
-#include "mpeg2/codec_utils.h"
-#include "mpeg2/aac_utils.h"
-#include <iostream>
-#include <fstream>
-#include <vector>
 #include <cstring>
+#include <fstream>
+#include <iostream>
+#include <vector>
+
+#include "mpeg2/aac_utils.h"
+#include "mpeg2/codec_utils.h"
+#include "mpeg2/ts_muxer.h"
 
 using namespace mpeg2;
 
-bool read_file(const std::string& path, std::string& content) {
+bool read_file(const std::string &path, std::string &content)
+{
     std::ifstream in(path, std::ios::binary | std::ios::ate);
-    if (!in) return false;
+    if (!in)
+        return false;
     size_t size = in.tellg();
     in.seekg(0, std::ios::beg);
     content.resize(size);
@@ -18,8 +21,10 @@ bool read_file(const std::string& path, std::string& content) {
     return true;
 }
 
-int main(int argc, char** argv) {
-    if (argc < 3) {
+int main(int argc, char **argv)
+{
+    if (argc < 3)
+    {
         std::cerr << "Usage: " << argv[0] << " <input_file> <output_ts_file> [interval_ms]" << std::endl;
         return 1;
     }
@@ -28,22 +33,26 @@ int main(int argc, char** argv) {
     std::string output_file = argv[2];
 
     bool is_h265 = false;
-    if (input_file.size() >= 5 && input_file.substr(input_file.size() - 5) == ".h265") {
+    if (input_file.size() >= 5 && input_file.substr(input_file.size() - 5) == ".h265")
+    {
         is_h265 = true;
     }
 
     int interval = 40; // Default 40ms (25fps)
-    if (argc >= 4) {
+    if (argc >= 4)
+    {
         interval = std::stoi(argv[3]);
     }
 
     std::string aac_file = "test.aac";
-    if (argc >= 5) {
+    if (argc >= 5)
+    {
         aac_file = argv[4];
     }
 
     std::string aac_content;
-    if (!read_file(aac_file, aac_content)) {
+    if (!read_file(aac_file, aac_content))
+    {
         std::cerr << "Failed to read " << aac_file << std::endl;
         // return -1; // Don't fail if audio file missing, just skip audio? Or fail?
         // User request says "use parameter to pass in", implying they want to test it.
@@ -52,9 +61,9 @@ int main(int argc, char** argv) {
     }
 
     std::vector<std::string> aac_frames;
-    mpeg2::SplitAACFrame((const uint8_t*)aac_content.data(), aac_content.size(), [&](const uint8_t* data, int size) {
-        aac_frames.push_back(std::string((const char*)data, size));
-    });
+    mpeg2::SplitAACFrame((const uint8_t *)aac_content.data(), aac_content.size(),
+                         [&](const uint8_t *data, int size)
+                         { aac_frames.push_back(std::string((const char *)data, size)); });
 
     std::cout << "AAC frames: " << aac_frames.size() << std::endl;
 
@@ -63,36 +72,38 @@ int main(int argc, char** argv) {
     uint16_t audio_pid = muxer.AddStream(mpeg2::TS_STREAM_AAC);
 
     std::ofstream out(output_file, std::ios::binary);
-    if (!out) {
+    if (!out)
+    {
         std::cerr << "Failed to open output file" << std::endl;
         return 1;
     }
 
-    muxer.SetOnPacket([&](const std::vector<uint8_t>& packet) {
-        out.write((const char*)packet.data(), packet.size());
-    });
+    muxer.SetOnPacket([&](const std::vector<uint8_t> &packet)
+                      { out.write((const char *)packet.data(), packet.size()); });
 
     // Read file content
     std::ifstream in(input_file, std::ios::binary | std::ios::ate);
-    if (!in) {
+    if (!in)
+    {
         std::cerr << "Failed to open input file" << std::endl;
         return 1;
     }
     size_t size = in.tellg();
     in.seekg(0, std::ios::beg);
     std::vector<uint8_t> buffer(size);
-    in.read((char*)buffer.data(), size);
+    in.read((char *)buffer.data(), size);
 
     uint64_t pts = 0;
     uint64_t dts = 0;
-    
+
     uint64_t audio_pts = 0;
     size_t aac_idx = 0;
 
     std::vector<uint8_t> au_buffer;
     bool has_vcl = false;
 
-    CodecUtils::SplitFrame(buffer.data(), size, [&](const uint8_t* nalu, size_t len) {
+    CodecUtils::SplitFrame(buffer.data(), size, [&](const uint8_t *nalu, size_t len)
+                           {
         bool new_au = false;
         bool is_vcl = false;
         bool is_aud = false;
@@ -103,7 +114,7 @@ int main(int argc, char** argv) {
         static std::vector<uint8_t> last_vps;
         static std::vector<uint8_t> last_sps;
         static std::vector<uint8_t> last_pps;
-        
+
         // Flags for current AU
         static bool au_has_vps = false;
         static bool au_has_sps = false;
@@ -128,7 +139,7 @@ int main(int argc, char** argv) {
                 au_has_pps = true;
                 is_sps_pps = true;
             }
-            
+
             if (is_aud) new_au = true;
             if (is_sps_pps) {
                 if (has_vcl) new_au = true;
@@ -173,20 +184,20 @@ int main(int argc, char** argv) {
 
         if (new_au && !au_buffer.empty()) {
             muxer.Write(video_pid, au_buffer.data(), au_buffer.size(), pts, dts);
-            
+
             // Write Audio frames to catch up
             while (audio_pts < pts && aac_idx < aac_frames.size()) {
                 muxer.Write(audio_pid, (const uint8_t*)aac_frames[aac_idx].data(), aac_frames[aac_idx].size(), audio_pts, audio_pts);
                 audio_pts += (1024 * 90000) / 44100;
                 aac_idx++;
             }
-            if (aac_idx >= aac_frames.size()) aac_idx = 0; // Loop audio
+            if (aac_idx >= aac_frames.size()) aac_idx = 0;  // Loop audio
 
-            pts += interval * 90; // interval is in ms, pts is 90kHz. 1ms = 90 ticks.
+            pts += interval * 90;  // interval is in ms, pts is 90kHz. 1ms = 90 ticks.
             dts += interval * 90;
             au_buffer.clear();
             has_vcl = false;
-            
+
             // Reset AU flags for new AU
             au_has_vps = false;
             au_has_sps = false;
@@ -197,18 +208,27 @@ int main(int argc, char** argv) {
         if (is_idr) {
             if (is_h265) {
                 if (!au_has_vps && !last_vps.empty()) {
-                    au_buffer.push_back(0x00); au_buffer.push_back(0x00); au_buffer.push_back(0x00); au_buffer.push_back(0x01);
+                    au_buffer.push_back(0x00);
+                    au_buffer.push_back(0x00);
+                    au_buffer.push_back(0x00);
+                    au_buffer.push_back(0x01);
                     au_buffer.insert(au_buffer.end(), last_vps.begin(), last_vps.end());
                     au_has_vps = true;
                 }
             }
             if (!au_has_sps && !last_sps.empty()) {
-                au_buffer.push_back(0x00); au_buffer.push_back(0x00); au_buffer.push_back(0x00); au_buffer.push_back(0x01);
+                au_buffer.push_back(0x00);
+                au_buffer.push_back(0x00);
+                au_buffer.push_back(0x00);
+                au_buffer.push_back(0x01);
                 au_buffer.insert(au_buffer.end(), last_sps.begin(), last_sps.end());
                 au_has_sps = true;
             }
             if (!au_has_pps && !last_pps.empty()) {
-                au_buffer.push_back(0x00); au_buffer.push_back(0x00); au_buffer.push_back(0x00); au_buffer.push_back(0x01);
+                au_buffer.push_back(0x00);
+                au_buffer.push_back(0x00);
+                au_buffer.push_back(0x00);
+                au_buffer.push_back(0x01);
                 au_buffer.insert(au_buffer.end(), last_pps.begin(), last_pps.end());
                 au_has_pps = true;
             }
@@ -221,10 +241,10 @@ int main(int argc, char** argv) {
         au_buffer.insert(au_buffer.end(), nalu, nalu + len);
         if (is_vcl) has_vcl = true;
 
-        return true;
-    });
+        return true; });
 
-    if (!au_buffer.empty()) {
+    if (!au_buffer.empty())
+    {
         muxer.Write(video_pid, au_buffer.data(), au_buffer.size(), pts, dts);
     }
 

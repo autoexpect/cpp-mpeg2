@@ -1,7 +1,9 @@
 build
 gomedia
-
 ts_test
+
+.cache
+compile_commands.json
 
 *.o
 *.a
