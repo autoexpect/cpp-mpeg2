@@ -29,48 +29,64 @@ namespace mpeg2
         Variable_Header.Number_of_raw_data_blocks_in_frame = aac[6] & 0x03;
     }
 
-    int FindSyncword(const uint8_t *data, int size, int offset)
+    int ADTSSampleRate(uint8_t sampling_frequency_index)
     {
-        for (int i = offset; i < size - 1; i++)
+        static const int kRates[16] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
+                                       16000, 12000, 11025, 8000,  7350,  0,     0,     0};
+        return kRates[sampling_frequency_index & 0x0F];
+    }
+
+    ptrdiff_t FindSyncword(const uint8_t *data, size_t size, size_t offset)
+    {
+        for (size_t i = offset; i + 1 < size; i++)
         {
-            if (data[i] == 0xFF && (data[i + 1] & 0xF0) == 0xF0)
+            // 12-bit syncword 0xFFF plus layer == '00', which rules out MPEG audio
+            // frames and most random 0xFF runs.
+            if (data[i] == 0xFF && (data[i + 1] & 0xF6) == 0xF0)
             {
-                return i;
+                return (ptrdiff_t)i;
             }
         }
         return -1;
     }
 
-    void SplitAACFrame(const uint8_t *data, int size,
-                       std::function<void(const uint8_t *, int)> onFrame)
+    void SplitAACFrame(const uint8_t *data, size_t size,
+                       std::function<void(const uint8_t *, size_t)> onFrame)
     {
-        ADTS_Frame_Header adts;
-        int start = FindSyncword(data, size, 0);
-        while (start >= 0)
+        if (data == nullptr || !onFrame)
         {
-            if (start + 7 > size)
-            { // Header size is at least 7 bytes
-                break;
-            }
-            adts.Decode(data + start);
-            int frame_len = adts.Variable_Header.Frame_length;
+            return;
+        }
 
-            if (frame_len == 0)
+        ADTS_Frame_Header adts;
+        ptrdiff_t found = FindSyncword(data, size, 0);
+        while (found >= 0)
+        {
+            const size_t start = (size_t)found;
+            if (start + ADTS_HEADER_MIN_SIZE > size)
             {
-                // Avoid infinite loop if frame length is 0 (should not happen in valid ADTS)
-                start = FindSyncword(data, size, start + 1);
+                break; // not enough bytes left to even hold a header
+            }
+
+            adts.Decode(data + start);
+            const size_t frame_len = adts.Variable_Header.Frame_length;
+            const size_t min_len = adts.Fix_Header.Protection_absent ? 7u : 9u;
+
+            // A frame that cannot hold its own header means we locked onto a false
+            // syncword; resync one byte on rather than trusting the length.
+            if (frame_len < min_len)
+            {
+                found = FindSyncword(data, size, start + 1);
                 continue;
             }
 
-            if (start + frame_len <= size)
+            if (start + frame_len > size)
             {
-                onFrame(data + start, frame_len);
-                start = FindSyncword(data, size, start + frame_len);
+                break; // trailing frame is truncated
             }
-            else
-            {
-                break;
-            }
+
+            onFrame(data + start, frame_len);
+            found = FindSyncword(data, size, start + frame_len);
         }
     }
 

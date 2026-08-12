@@ -32,6 +32,14 @@ namespace mpeg2
 
     uint64_t BitStream::GetBits(int n)
     {
+        if (n <= 0)
+        {
+            return 0;
+        }
+        if (n > 64)
+        {
+            throw std::out_of_range("GetBits: n > 64");
+        }
         if (bytesOffset_ >= size_)
         {
             throw std::out_of_range("OUT OF RANGE");
@@ -118,7 +126,12 @@ namespace mpeg2
         int leadingZeroBits = 0;
         while (GetBit() == 0)
         {
-            leadingZeroBits++;
+            // A run this long means the data is not a valid exp-Golomb code;
+            // 1 << leadingZeroBits would be undefined beyond 63.
+            if (++leadingZeroBits >= 32)
+            {
+                throw std::out_of_range("ReadUE: invalid exp-Golomb code");
+            }
         }
         if (leadingZeroBits == 0)
         {
@@ -172,21 +185,30 @@ namespace mpeg2
 
     BitStreamWriter::~BitStreamWriter() {}
 
-    void BitStreamWriter::expandSpace(int n)
+    void BitStreamWriter::expandSpace(size_t bits)
     {
-        if ((bits_.size() - byteOffset_ - 1) * 8 + 8 - bitOffset_ < (size_t)n)
+        if (bits == 0)
         {
-            size_t newlen = 0;
-            if (bits_.size() * 8 < (size_t)n)
-            {
-                newlen = bits_.size() + n / 8 + 1;
-            }
-            else
-            {
-                newlen = bits_.size() * 2;
-            }
-            bits_.resize(newlen, 0);
+            return;
         }
+        // byteOffset_ can sit at (or past) the end after FillRemainData, so the
+        // available count has to be computed without wrapping around zero.
+        size_t available = 0;
+        if (byteOffset_ < bits_.size())
+        {
+            available = (bits_.size() - byteOffset_) * 8 - (size_t)bitOffset_;
+        }
+        if (available >= bits)
+        {
+            return;
+        }
+        // One extra byte so a straddling write can always touch byteOffset_ + 1.
+        size_t newlen = byteOffset_ + (bits + 7) / 8 + 1;
+        if (newlen < bits_.size() * 2)
+        {
+            newlen = bits_.size() * 2;
+        }
+        bits_.resize(newlen, 0);
     }
 
     void BitStreamWriter::PutByte(uint8_t v)
@@ -211,7 +233,11 @@ namespace mpeg2
         {
             throw std::runtime_error("bsw.bitsoffset > 0");
         }
-        expandSpace(8 * size);
+        if (size == 0)
+        {
+            return;
+        }
+        expandSpace(size * 8);
         std::memcpy(&bits_[byteOffset_], v, size);
         byteOffset_ += size;
     }
@@ -226,7 +252,15 @@ namespace mpeg2
 
     void BitStreamWriter::PutUint64(uint64_t v, int n)
     {
-        expandSpace(n);
+        if (n <= 0)
+        {
+            return;
+        }
+        if (n > 64)
+        {
+            throw std::out_of_range("PutUint64: n > 64");
+        }
+        expandSpace((size_t)n);
         if (8 - bitOffset_ >= n)
         {
             bits_[byteOffset_] |= ((uint8_t)(v)&BitMask[n - 1]) << (8 - bitOffset_ - n);

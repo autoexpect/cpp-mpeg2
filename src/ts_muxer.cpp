@@ -1,5 +1,6 @@
 #include "mpeg2/ts_muxer.h"
 
+#include <algorithm>
 #include <iostream>
 
 #include "mpeg2/codec_utils.h"
@@ -8,44 +9,99 @@
 namespace mpeg2
 {
 
-    TSMuxer::TSMuxer() : stream_pid_counter_(0x100), pmt_pid_counter_(0x200), pat_period_(0)
+    namespace
     {
-        pat_.cc = 0;
-        pat_.version_number = 0;
+        // PAT/PMT are repeated at least this often (400 ms at 90 kHz).
+        const uint64_t kPsiIntervalTicks = 400 * 90;
+
+        // Elementary stream PIDs are handed out from kFirstStreamPid upwards and
+        // PMT PIDs from kFirstPmtPid; the two ranges must not meet.
+        const uint16_t kFirstStreamPid = 0x100;
+        const uint16_t kFirstPmtPid = 0x200;
+
+        const uint8_t kTsSyncByte = 0x47;
+        const uint8_t kTableIdPat = 0x00;
+        const uint8_t kTableIdPmt = 0x02;
+
+        const uint8_t kAudH264[] = {0x00, 0x00, 0x00, 0x01, 0x09, 0xF0};
+        const uint8_t kAudH265[] = {0x00, 0x00, 0x00, 0x01, 0x46, 0x01, 0x50};
+
+        // A 33-bit PTS/DTS field, split by marker bits, as per ISO/IEC 13818-1 2.4.3.7.
+        void PutPesTimestamp(BitStreamWriter &bsw, uint8_t prefix, uint64_t ts)
+        {
+            bsw.PutUint8(prefix, 4);
+            bsw.PutUint8((ts >> 30) & 0x07, 3);
+            bsw.PutUint8(1, 1); // marker_bit
+            bsw.PutUint16((ts >> 15) & 0x7FFF, 15);
+            bsw.PutUint8(1, 1); // marker_bit
+            bsw.PutUint16(ts & 0x7FFF, 15);
+            bsw.PutUint8(1, 1); // marker_bit
+        }
+
+        const PmtStream *FindStream(const Pmt &pmt, uint16_t pid)
+        {
+            for (const auto &stream : pmt.streams)
+            {
+                if (stream.pid == pid)
+                {
+                    return &stream;
+                }
+            }
+            return nullptr;
+        }
+    } // namespace
+
+    TSMuxer::TSMuxer()
+        : stream_pid_counter_(kFirstStreamPid), pmt_pid_counter_(kFirstPmtPid), last_psi_dts_(0),
+          psi_sent_(false)
+    {
     }
 
     TSMuxer::~TSMuxer() {}
 
     uint16_t TSMuxer::AddStream(TS_STREAM_TYPE type)
     {
+        if (stream_pid_counter_ >= kFirstPmtPid)
+        {
+            return TS_INVALID_PID; // stream PID range exhausted
+        }
+
         if (pat_.pmts.empty())
         {
             Pmt pmt;
             pmt.pid = pmt_pid_counter_++;
             pmt.program_number = 1;
-            pmt.version_number = 0;
-            pmt.cc = 0;
-            pmt.pcr_pid = 0;
             pat_.pmts.push_back(pmt);
         }
 
         uint16_t pid = stream_pid_counter_++;
         PmtStream stream;
-        stream.stream_type = type;
+        stream.stream_type = static_cast<uint8_t>(type);
         stream.pid = pid;
-        stream.cc = 0;
 
         pat_.pmts[0].streams.push_back(stream);
+
+        // Adding a stream after the tables went out changes the PMT contents, so
+        // receivers must be told to re-parse it.
+        if (psi_sent_)
+        {
+            pat_.pmts[0].version_number = (pat_.pmts[0].version_number + 1) & 0x1F;
+        }
         return pid;
     }
 
     void TSMuxer::SetOnPacket(std::function<void(const std::vector<uint8_t> &)> callback)
     {
-        on_packet_ = callback;
+        on_packet_ = std::move(callback);
     }
 
     void TSMuxer::Write(uint16_t pid, const uint8_t *data, size_t size, uint64_t pts, uint64_t dts)
     {
+        if (data == nullptr || size == 0)
+        {
+            return;
+        }
+
         Pmt *whichpmt = nullptr;
         PmtStream *whichstream = nullptr;
 
@@ -60,6 +116,10 @@ namespace mpeg2
                     break;
                 }
             }
+            if (whichstream)
+            {
+                break;
+            }
         }
 
         if (!whichpmt || !whichstream)
@@ -67,70 +127,111 @@ namespace mpeg2
             return;
         }
 
-        if (whichpmt->pcr_pid == 0 || (whichstream->stream_type == TS_STREAM_H264 ||
-                                       whichstream->stream_type == TS_STREAM_H265))
+        // The PCR rides on a video stream when there is one; otherwise on whichever
+        // stream shows up first. Once a video stream owns it we never hand it back,
+        // so two video streams cannot make it oscillate.
+        const bool is_video = TSIsVideoStreamType(whichstream->stream_type);
+        if (whichpmt->pcr_pid != pid)
         {
-            // Prefer video for PCR
-            if (whichpmt->pcr_pid == 0)
+            const PmtStream *pcr_stream = FindStream(*whichpmt, whichpmt->pcr_pid);
+            if (pcr_stream == nullptr || (is_video && !TSIsVideoStreamType(pcr_stream->stream_type)))
             {
                 whichpmt->pcr_pid = pid;
-            }
-            else if (whichstream->stream_type == TS_STREAM_H264 ||
-                     whichstream->stream_type == TS_STREAM_H265)
-            {
-                // If we found a video stream, switch PCR to it (simple logic from Go code)
-                // actually Go code says: if pcr_pid == 0 || (video && pcr_pid != pid) -> set pcr_pid =
-                // pid But we should be careful not to switch back and forth if multiple videos? For now
-                // follow Go logic: if video, set as PCR.
-                whichpmt->pcr_pid = pid;
+                if (psi_sent_)
+                {
+                    whichpmt->version_number = (whichpmt->version_number + 1) & 0x1F;
+                }
             }
         }
 
         bool with_aud = false;
         bool idr_flag = false;
 
-        if (whichstream->stream_type == TS_STREAM_H264)
+        if (is_video)
         {
-            CodecUtils::SplitFrame(data, size, [&](const uint8_t *nalu, size_t len)
+            const bool h265 = (whichstream->stream_type == TS_STREAM_H265);
+            CodecUtils::SplitFrame(data, size,
+                                   [&](const uint8_t *nalu, size_t len)
                                    {
-            if (CodecUtils::IsH264AUD(nalu, len)) {
-                with_aud = true;
-            }
-            if (CodecUtils::IsH264VCL(nalu, len)) {
-                if (CodecUtils::IsH264IDR(nalu, len)) {
-                    idr_flag = true;
-                }
-            }
-            return true; });
-        }
-        else if (whichstream->stream_type == TS_STREAM_H265)
-        {
-            CodecUtils::SplitFrame(data, size, [&](const uint8_t *nalu, size_t len)
-                                   {
-            if (CodecUtils::IsH265AUD(nalu, len)) {
-                with_aud = true;
-            }
-            if (CodecUtils::IsH265VCL(nalu, len)) {
-                if (CodecUtils::IsH265IDR(nalu, len)) {
-                    idr_flag = true;
-                }
-            }
-            return true; });
+                                       if (h265)
+                                       {
+                                           if (CodecUtils::IsH265AUD(nalu, len))
+                                               with_aud = true;
+                                           if (CodecUtils::IsH265IDR(nalu, len))
+                                               idr_flag = true;
+                                       }
+                                       else
+                                       {
+                                           if (CodecUtils::IsH264AUD(nalu, len))
+                                               with_aud = true;
+                                           if (CodecUtils::IsH264IDR(nalu, len))
+                                               idr_flag = true;
+                                       }
+                                       return true;
+                                   });
         }
 
-        if (pat_period_ == 0 || pat_period_ + 400 < dts)
+        // Re-emit the tables periodically, and immediately after a large jump
+        // backwards (a discontinuity) so a receiver still locks on. Interleaved
+        // streams routinely run slightly behind one another, so only a gap wider
+        // than the interval itself counts either way. Both differences are taken
+        // on unsigned values, so the two directions must be tested separately.
+        bool need_psi = !psi_sent_;
+        if (psi_sent_)
         {
-            pat_period_ = dts;
-            if (pat_period_ == 0)
-                pat_period_ = 1;
+            const uint64_t delta = (dts >= last_psi_dts_) ? (dts - last_psi_dts_) : (last_psi_dts_ - dts);
+            need_psi = (delta >= kPsiIntervalTicks);
+        }
+        if (need_psi)
+        {
+            last_psi_dts_ = dts;
             WritePat();
             for (auto &pmt : pat_.pmts)
             {
                 WritePmt(pmt);
             }
+            psi_sent_ = true;
         }
 
-        WritePes(*whichstream, *whichpmt, data, size, pts * 90, dts * 90, idr_flag, with_aud);
+        WritePes(*whichstream, *whichpmt, data, size, pts, dts, idr_flag, with_aud);
+    }
+
+    void TSMuxer::FinishSection(BitStreamWriter &bsw, size_t length_loc, size_t section_start)
+    {
+        // section_length counts everything after the field itself, CRC included.
+        const size_t section_length = bsw.Size() - section_start + 4;
+        // section_syntax_indicator '1' + '0' + reserved '11' => 0xB000
+        bsw.SetUint16(static_cast<uint16_t>((section_length & 0x0FFF) | 0xB000), length_loc);
+
+        // The CRC covers the section from table_id up to (not including) the CRC.
+        const size_t crc_start = length_loc - 1;
+        const uint32_t crc = crc32<IEEE8023_CRC32_POLYNOMIAL>(0xFFFFFFFF, bsw.Bits().data() + crc_start,
+                                                              bsw.Size() - crc_start);
+        bsw.PutByte((crc >> 24) & 0xFF);
+        bsw.PutByte((crc >> 16) & 0xFF);
+        bsw.PutByte((crc >> 8) & 0xFF);
+        bsw.PutByte(crc & 0xFF);
+
+        bsw.FillRemainData(0xFF);
+        EmitPacket(bsw);
+    }
+
+    void TSMuxer::EmitPacket(BitStreamWriter &bsw)
+    {
+        // A section that outgrew one packet would silently corrupt the stream;
+        // drop it loudly instead. Sections are never split across packets, which
+        // caps a program at 33 elementary streams ((188 - 21) / 5).
+        if (bsw.Size() != static_cast<size_t>(TS_PACKET_SIZE) ||
+            bsw.Bits().size() != static_cast<size_t>(TS_PACKET_SIZE))
+        {
+            std::cerr << "mpeg2: dropping malformed TS packet of " << bsw.Size() << " bytes"
+                      << std::endl;
+            return;
+        }
+        if (on_packet_)
+        {
+            on_packet_(bsw.Bits());
+        }
     }
 
     void TSMuxer::WritePat()
@@ -138,27 +239,26 @@ namespace mpeg2
         BitStreamWriter bsw(TS_PACKET_SIZE);
 
         // TS Header
-        bsw.PutByte(0x47);
-        bsw.PutUint8(0, 1);   // transport_error_indicator
-        bsw.PutUint8(1, 1);   // payload_unit_start_indicator
-        bsw.PutUint8(0, 1);   // transport_priority
-        bsw.PutUint16(0, 13); // PID 0 for PAT
-        bsw.PutUint8(0, 2);   // transport_scrambling_control
-        bsw.PutUint8(1, 2);   // adaptation_field_control (payload only)
+        bsw.PutByte(kTsSyncByte);
+        bsw.PutUint8(0, 1);            // transport_error_indicator
+        bsw.PutUint8(1, 1);            // payload_unit_start_indicator
+        bsw.PutUint8(0, 1);            // transport_priority
+        bsw.PutUint16(TS_PID_PAT, 13); // PID 0 for PAT
+        bsw.PutUint8(0, 2);            // transport_scrambling_control
+        bsw.PutUint8(1, 2);            // adaptation_field_control (payload only)
         bsw.PutUint8(pat_.cc, 4);
-        pat_.cc = (pat_.cc + 1) % 16;
+        pat_.cc = (pat_.cc + 1) & 0x0F;
 
-        bsw.PutByte(0x00); // pointer field
+        bsw.PutByte(0x00); // pointer_field
 
-        // PAT Table
-        bsw.PutUint8(0x00, 8); // table_id
-        int loc = bsw.Size();  // Start of section length part (after table_id)
-        bsw.PutUint8(1, 1);    // section_syntax_indicator
-        bsw.PutUint8(0, 1);    // '0'
-        bsw.PutUint8(3, 2);    // reserved
-        bsw.PutUint16(0, 12);  // section_length (placeholder)
+        bsw.PutByte(kTableIdPat);
+        const size_t length_loc = bsw.Size(); // section_length field position
+        bsw.PutUint8(1, 1);                   // section_syntax_indicator (patched by FinishSection)
+        bsw.PutUint8(0, 1);                   // '0'
+        bsw.PutUint8(3, 2);                   // reserved
+        bsw.PutUint16(0, 12);                 // section_length placeholder
 
-        int section_start = bsw.Size(); // Start of section data (after length)
+        const size_t section_start = bsw.Size();
 
         bsw.PutUint16(1, 16); // transport_stream_id
         bsw.PutUint8(3, 2);   // reserved
@@ -174,27 +274,7 @@ namespace mpeg2
             bsw.PutUint16(pmt.pid, 13);
         }
 
-        // CRC32
-        int section_length = bsw.Size() - section_start + 4; // +4 for CRC
-        bsw.SetUint16((section_length & 0x0FFF) | (1 << 15) | 0x3000, loc);
-
-        // CRC starts from table_id (loc - 1) and covers the entire section except CRC itself
-        int crc_start = loc - 1; // table_id position
-        int crc_len = bsw.Size() - crc_start;
-        uint32_t crc =
-            crc32<IEEE8023_CRC32_POLYNOMIAL>(0xFFFFFFFF, bsw.Bits().data() + crc_start, crc_len);
-
-        // Write CRC in big-endian order (MSB first)
-        bsw.PutByte((crc >> 24) & 0xFF);
-        bsw.PutByte((crc >> 16) & 0xFF);
-        bsw.PutByte((crc >> 8) & 0xFF);
-        bsw.PutByte(crc & 0xFF);
-
-        bsw.FillRemainData(0xFF);
-        if (on_packet_)
-        {
-            on_packet_(bsw.Bits());
-        }
+        FinishSection(bsw, length_loc, section_start);
     }
 
     void TSMuxer::WritePmt(Pmt &pmt)
@@ -202,7 +282,7 @@ namespace mpeg2
         BitStreamWriter bsw(TS_PACKET_SIZE);
 
         // TS Header
-        bsw.PutByte(0x47);
+        bsw.PutByte(kTsSyncByte);
         bsw.PutUint8(0, 1);
         bsw.PutUint8(1, 1);
         bsw.PutUint8(0, 1);
@@ -210,392 +290,201 @@ namespace mpeg2
         bsw.PutUint8(0, 2);
         bsw.PutUint8(1, 2);
         bsw.PutUint8(pmt.cc, 4);
-        pmt.cc = (pmt.cc + 1) % 16;
+        pmt.cc = (pmt.cc + 1) & 0x0F;
 
-        bsw.PutByte(0x00); // pointer
+        bsw.PutByte(0x00); // pointer_field
 
-        // PMT Table
-        bsw.PutUint8(0x02, 8); // table_id (TS_TID_PMS)
-        int loc = bsw.Size();
-        bsw.PutUint8(1, 1); // section_syntax_indicator
-        bsw.PutUint8(0, 1);
-        bsw.PutUint8(3, 2);
+        bsw.PutByte(kTableIdPmt);
+        const size_t length_loc = bsw.Size();
+        bsw.PutUint8(1, 1);   // section_syntax_indicator
+        bsw.PutUint8(0, 1);   // '0'
+        bsw.PutUint8(3, 2);   // reserved
         bsw.PutUint16(0, 12); // section_length placeholder
 
-        int section_start = bsw.Size();
+        const size_t section_start = bsw.Size();
 
         bsw.PutUint16(pmt.program_number, 16);
-        bsw.PutUint8(3, 2);
+        bsw.PutUint8(3, 2); // reserved
         bsw.PutUint8(pmt.version_number, 5);
-        bsw.PutUint8(1, 1);
-        bsw.PutUint8(0, 8);
-        bsw.PutUint8(0, 8);
-        bsw.PutUint8(7, 3);
+        bsw.PutUint8(1, 1); // current_next_indicator
+        bsw.PutUint8(0, 8); // section_number
+        bsw.PutUint8(0, 8); // last_section_number
+        bsw.PutUint8(7, 3); // reserved
         bsw.PutUint16(pmt.pcr_pid, 13);
-        bsw.PutUint8(0x0F, 4);
-        bsw.PutUint16(0, 12); // program_info_length
+        bsw.PutUint8(0x0F, 4); // reserved
+        bsw.PutUint16(0, 12);  // program_info_length
 
         for (const auto &stream : pmt.streams)
         {
             bsw.PutUint8(stream.stream_type, 8);
-            bsw.PutUint8(7, 3);
+            bsw.PutUint8(7, 3); // reserved
             bsw.PutUint16(stream.pid, 13);
-            bsw.PutUint8(0x0F, 4);
-            bsw.PutUint16(0, 12); // ES_info_length
+            bsw.PutUint8(0x0F, 4); // reserved
+            bsw.PutUint16(0, 12);  // ES_info_length
         }
 
-        int section_length = bsw.Size() - section_start + 4;
-        bsw.SetUint16((section_length & 0x0FFF) | (1 << 15) | 0x3000, loc);
-
-        // CRC starts from table_id (loc - 1) and covers the entire section except CRC itself
-        int crc_start = loc - 1; // table_id position
-        int crc_len = bsw.Size() - crc_start;
-        uint32_t crc =
-            crc32<IEEE8023_CRC32_POLYNOMIAL>(0xFFFFFFFF, bsw.Bits().data() + crc_start, crc_len);
-
-        // Write CRC in big-endian order (MSB first)
-        bsw.PutByte((crc >> 24) & 0xFF);
-        bsw.PutByte((crc >> 16) & 0xFF);
-        bsw.PutByte((crc >> 8) & 0xFF);
-        bsw.PutByte(crc & 0xFF);
-
-        bsw.FillRemainData(0xFF);
-        if (on_packet_)
-        {
-            on_packet_(bsw.Bits());
-        }
+        FinishSection(bsw, length_loc, section_start);
     }
 
-    void TSMuxer::WritePes(PmtStream &stream, Pmt &pmt, const uint8_t *data, size_t size, uint64_t pts,
-                           uint64_t dts, bool idr_flag, bool with_aud)
+    void TSMuxer::WritePes(PmtStream &stream, Pmt &pmt, const uint8_t *data, size_t size,
+                           uint64_t pts, uint64_t dts, bool idr_flag, bool with_aud)
     {
-        bool first_pes_packet = true;
-        BitStreamWriter bsw(TS_PACKET_SIZE);
-        size_t offset = 0;
+        const bool is_video = TSIsVideoStreamType(stream.stream_type);
+        const bool with_dts = (pts != dts);
+        const uint8_t header_data_len = with_dts ? 10 : 5; // PTS [+ DTS], 5 bytes each
 
-        while (offset < size || first_pes_packet)
+        // Frames that carry no access unit delimiter get one synthesized, so every
+        // PES payload starts on a boundary a decoder can recognise.
+        const uint8_t *aud = nullptr;
+        size_t aud_len = 0;
+        if (!with_aud)
+        {
+            if (stream.stream_type == TS_STREAM_H264)
+            {
+                aud = kAudH264;
+                aud_len = sizeof(kAudH264);
+            }
+            else if (stream.stream_type == TS_STREAM_H265)
+            {
+                aud = kAudH265;
+                aud_len = sizeof(kAudH265);
+            }
+        }
+
+        BitStreamWriter pes(32);
+        pes.PutByte(0x00); // packet_start_code_prefix
+        pes.PutByte(0x00);
+        pes.PutByte(0x01);
+        pes.PutByte(is_video ? 0xE0 : 0xC0); // stream_id: video 0 / audio 0
+
+        // PES_packet_length counts every byte after this field. Video streams may
+        // declare 0 ("unbounded"), which avoids the 64 KiB ceiling entirely.
+        const size_t pes_len = size + aud_len + 3 + header_data_len;
+        pes.PutUint16((is_video || pes_len > 0xFFFF) ? 0 : static_cast<uint16_t>(pes_len), 16);
+
+        pes.PutUint8(0x02, 2); // '10'
+        pes.PutUint8(0, 2);    // PES_scrambling_control
+        pes.PutUint8(0, 1);    // PES_priority
+        pes.PutUint8(1, 1);    // data_alignment_indicator: payload starts at an AU
+        pes.PutUint8(0, 1);    // copyright
+        pes.PutUint8(0, 1);    // original_or_copy
+
+        pes.PutUint8(with_dts ? 0x03 : 0x02, 2); // PTS_DTS_flags
+        pes.PutUint8(0, 1);                      // ESCR_flag
+        pes.PutUint8(0, 1);                      // ES_rate_flag
+        pes.PutUint8(0, 1);                      // DSM_trick_mode_flag
+        pes.PutUint8(0, 1);                      // additional_copy_info_flag
+        pes.PutUint8(0, 1);                      // PES_CRC_flag
+        pes.PutUint8(0, 1);                      // PES_extension_flag
+
+        pes.PutByte(header_data_len);
+        PutPesTimestamp(pes, with_dts ? 0x03 : 0x02, pts);
+        if (with_dts)
+        {
+            PutPesTimestamp(pes, 0x01, dts);
+        }
+
+        // Everything that precedes the elementary stream data in the first packet.
+        std::vector<uint8_t> header(pes.Bits().begin(), pes.Bits().begin() + pes.Size());
+        if (aud_len > 0)
+        {
+            header.insert(header.end(), aud, aud + aud_len);
+        }
+
+        size_t header_off = 0;
+        size_t data_off = 0;
+        bool first = true;
+        BitStreamWriter bsw(TS_PACKET_SIZE);
+
+        while (first || header_off < header.size() || data_off < size)
         {
             bsw.Reset();
 
+            const size_t remaining = (header.size() - header_off) + (size - data_off);
+
+            // The adaptation field is sized before anything is written, so the
+            // payload length is exact and no back-patching is needed.
+            const bool want_pcr = first && (stream.pid == pmt.pcr_pid);
+            const bool want_rai = first && idr_flag;
+            bool has_af = want_pcr || want_rai;
+            size_t af_body = has_af ? (1 + (want_pcr ? 6u : 0u)) : 0; // flags [+ PCR]
+            size_t af_total = has_af ? (1 + af_body) : 0;             // + length byte
+            size_t space = TS_PACKET_SIZE - 4 - af_total;
+
+            if (remaining < space)
+            {
+                // Short payload: pad via adaptation field stuffing, never by
+                // appending filler after the payload.
+                const size_t stuffing = space - remaining;
+                if (!has_af)
+                {
+                    has_af = true;
+                    af_total = stuffing; // the length byte itself absorbs one byte
+                    af_body = af_total - 1;
+                }
+                else
+                {
+                    af_body += stuffing;
+                    af_total += stuffing;
+                }
+                space = TS_PACKET_SIZE - 4 - af_total; // now equals `remaining`
+            }
+
             // TS Header
-            bsw.PutByte(0x47);
-            bsw.PutUint8(0, 1);
-            bsw.PutUint8(first_pes_packet ? 1 : 0, 1);
-            bsw.PutUint8(0, 1);
+            bsw.PutByte(kTsSyncByte);
+            bsw.PutUint8(0, 1);             // transport_error_indicator
+            bsw.PutUint8(first ? 1 : 0, 1); // payload_unit_start_indicator
+            bsw.PutUint8(0, 1);             // transport_priority
             bsw.PutUint16(stream.pid, 13);
-            bsw.PutUint8(0, 2);
+            bsw.PutUint8(0, 2); // transport_scrambling_control
+            bsw.PutUint8(has_af ? 0x03 : 0x01, 2);
+            bsw.PutUint8(stream.cc, 4);
+            stream.cc = (stream.cc + 1) & 0x0F;
 
-            uint8_t adaptation_field_control = 0x01; // Payload only default
-            uint8_t continuity_counter = stream.cc;
-            stream.cc = (stream.cc + 1) % 16;
-
-            int head_len = 4;
-            bool write_adaptation = false;
-            bool write_pcr = false;
-
-            if (first_pes_packet && idr_flag)
+            if (has_af)
             {
-                write_adaptation = true;
-            }
-            if (first_pes_packet && stream.pid == pmt.pcr_pid)
-            {
-                write_adaptation = true;
-                write_pcr = true;
-            }
-
-            if (write_adaptation)
-            {
-                adaptation_field_control |= 0x02; // 0x01 | 0x02 = 0x03 (Adaptation + Payload)
-            }
-
-            bsw.PutUint8(adaptation_field_control, 2);
-            bsw.PutUint8(continuity_counter, 4);
-
-            if (write_adaptation)
-            {
-                // Adaptation field length placeholder
-                int adaptation_len_loc = bsw.Size();
-                bsw.PutByte(0);
-                head_len++;
-
-                int adaptation_start = bsw.Size();
-
-                uint8_t flags = 0;
-                if (first_pes_packet && idr_flag)
-                    flags |= 0x40; // random_access_indicator
-                if (write_pcr)
-                    flags |= 0x10; // PCR_flag
-
-                bsw.PutByte(flags);
-
-                if (write_pcr)
+                bsw.PutByte(static_cast<uint8_t>(af_body));
+                if (af_body > 0)
                 {
-                    uint64_t pcr_base = 0;
-                    uint16_t pcr_ext = 0;
-                    if (dts == 0)
-                    {
-                        pcr_base = pts * 300 / 300;
-                        pcr_ext = (pts * 300) % 300;
-                    }
-                    else
-                    {
-                        pcr_base = dts * 300 / 300;
-                        pcr_ext = (dts * 300) % 300;
-                    }
-                    bsw.PutUint64(pcr_base, 33);
-                    bsw.PutUint8(0x3F, 6); // reserved
-                    bsw.PutUint16(pcr_ext, 9);
-                }
+                    uint8_t flags = 0;
+                    if (want_rai)
+                        flags |= 0x40; // random_access_indicator
+                    if (want_pcr)
+                        flags |= 0x10; // PCR_flag
+                    bsw.PutByte(flags);
 
-                int adaptation_len = bsw.Size() - adaptation_start;
-                bsw.SetByte(adaptation_len, adaptation_len_loc);
-                head_len += adaptation_len;
-            }
-
-            // PES Header (only for first packet)
-            std::vector<uint8_t> payload;
-            if (first_pes_packet)
-            {
-                // Calculate PES header length
-                // ...
-                // Actually we need to append AUD if needed
-                if (!with_aud)
-                {
-                    if (stream.stream_type == TS_STREAM_H264)
+                    if (want_pcr)
                     {
-                        payload.push_back(0x00);
-                        payload.push_back(0x00);
-                        payload.push_back(0x00);
-                        payload.push_back(0x01);
-                        payload.push_back(0x09);
-                        payload.push_back(0xF0);
+                        const uint64_t pcr = (dts != 0) ? dts : pts;
+                        bsw.PutUint64(pcr & 0x1FFFFFFFFULL, 33); // program_clock_reference_base
+                        bsw.PutUint8(0x3F, 6);                   // reserved
+                        bsw.PutUint16(0, 9); // extension: the 27 MHz remainder is always 0 here
                     }
-                    else if (stream.stream_type == TS_STREAM_H265)
+                    for (size_t i = 1 + (want_pcr ? 6u : 0u); i < af_body; i++)
                     {
-                        payload.push_back(0x00);
-                        payload.push_back(0x00);
-                        payload.push_back(0x00);
-                        payload.push_back(0x01);
-                        payload.push_back(0x46);
-                        payload.push_back(0x01);
-                        payload.push_back(0x50);
+                        bsw.PutByte(0xFF); // stuffing_byte
                     }
                 }
-
-                // PES Packet
-                // packet_start_code_prefix 0x000001
-                // stream_id
-                // PES_packet_length
-
-                // We need to buffer PES header to write it into BSW
-                BitStreamWriter pes_hdr(64);
-                pes_hdr.PutByte(0x00);
-                pes_hdr.PutByte(0x00);
-                pes_hdr.PutByte(0x01);
-
-                uint8_t stream_id = 0xE0; // Video 0
-                // TODO: Map stream type to stream id properly if multiple videos/audios
-                if (stream.stream_type == TS_STREAM_AUDIO_MPEG1 ||
-                    stream.stream_type == TS_STREAM_AUDIO_MPEG2 ||
-                    stream.stream_type == TS_STREAM_AAC)
-                {
-                    stream_id = 0xC0; // Audio 0
-                }
-                pes_hdr.PutByte(stream_id);
-
-                uint16_t pes_packet_len = 0;
-                size_t total_data_len = size + payload.size();
-
-                int header_data_len = 5; // PTS only
-                int flags_len = 3;       // Flags (2) + Header Length (1)
-                if (pts != dts)
-                {
-                    header_data_len = 10; // PTS + DTS
-                }
-
-                // If video, can be 0 if too large? Go code says: if headlen-oldheadlen-6+len(data) >
-                // 0xFFFF -> 0 But here we are calculating PES packet length field. For video, if length
-                // > 0xFFFF, set to 0. For video, if length > 0xFFFF, set to 0. Actually, for video
-                // streams, it is often safer to set PES_packet_length to 0 (unbounded) to avoid issues
-                // if the frame is larger than 64KB, and some players/tools prefer it. The previous
-                // logic tried to calculate it but might be overflowing or incorrect for large frames.
-                if (stream.stream_type == TS_STREAM_H264 || stream.stream_type == TS_STREAM_H265)
-                {
-                    pes_packet_len = 0;
-                }
-                else
-                {
-                    if (total_data_len + flags_len + header_data_len > 0xFFFF)
-                    {
-                        pes_packet_len = 0;
-                    }
-                    else
-                    {
-                        pes_packet_len = total_data_len + flags_len + header_data_len;
-                    }
-                }
-                pes_hdr.PutUint16(pes_packet_len, 16);
-
-                pes_hdr.PutUint8(0x02, 2); // '10'
-                pes_hdr.PutUint8(0, 2);    // Scrambling control
-                pes_hdr.PutUint8(0, 1);    // Priority
-                pes_hdr.PutUint8(0, 1);    // Data alignment
-                pes_hdr.PutUint8(0, 1);    // Copyright
-                pes_hdr.PutUint8(0, 1);    // Original
-
-                if (pts != dts)
-                {
-                    pes_hdr.PutUint8(0x03, 2); // PTS_DTS_flags = '11'
-                }
-                else
-                {
-                    pes_hdr.PutUint8(0x02, 2); // PTS_DTS_flags = '10'
-                }
-                pes_hdr.PutUint8(0, 1); // ESCR flag
-                pes_hdr.PutUint8(0, 1); // ES rate flag
-                pes_hdr.PutUint8(0, 1); // DSM trick mode flag
-                pes_hdr.PutUint8(0, 1); // Additional copy info flag
-                pes_hdr.PutUint8(0, 1); // CRC flag
-                pes_hdr.PutUint8(0, 1); // Extension flag
-
-                pes_hdr.PutByte(header_data_len); // PES_header_data_length
-
-                // PTS
-                if (pts != dts)
-                {
-                    pes_hdr.PutUint8(0x03, 4); // '0011'
-                }
-                else
-                {
-                    pes_hdr.PutUint8(0x02, 4); // '0010'
-                }
-                pes_hdr.PutUint8((pts >> 30) & 0x07, 3);
-                pes_hdr.PutUint8(1, 1);
-                pes_hdr.PutUint16((pts >> 15) & 0x7FFF, 15);
-                pes_hdr.PutUint8(1, 1);
-                pes_hdr.PutUint16(pts & 0x7FFF, 15);
-                pes_hdr.PutUint8(1, 1);
-
-                // DTS
-                if (pts != dts)
-                {
-                    pes_hdr.PutUint8(0x01, 4); // '0001'
-                    pes_hdr.PutUint8((dts >> 30) & 0x07, 3);
-                    pes_hdr.PutUint8(1, 1);
-                    pes_hdr.PutUint16((dts >> 15) & 0x7FFF, 15);
-                    pes_hdr.PutUint8(1, 1);
-                    pes_hdr.PutUint16(dts & 0x7FFF, 15);
-                    pes_hdr.PutUint8(1, 1);
-                }
-
-                // Add PES header to payload
-                const std::vector<uint8_t> &pes_hdr_bytes = pes_hdr.Bits();
-                payload.insert(payload.begin(), pes_hdr_bytes.begin(),
-                               pes_hdr_bytes.begin() + pes_hdr.Size());
             }
 
-            // Now we have payload (PES header + AUD + data chunk)
-            // But wait, payload vector currently only has PES header + AUD.
-            // Data is in `data` pointer.
-
-            // We need to fill the TS packet.
-            // Available space in TS packet = 188 - head_len.
-            int available = TS_PACKET_SIZE - head_len;
-
-            // If we need stuffing
-            // Logic: if payload + data < available, we stuff.
-            // Else we fill.
-
-            // But we have two sources of data: `payload` (header/AUD) and `data` (frame).
-            // We consume `payload` first, then `data`.
-
-            // Stuffing logic
-            size_t remaining_payload = payload.size();
-            size_t remaining_data = size - offset;
-            size_t total_remaining = remaining_payload + remaining_data;
-
-            if (total_remaining < (size_t)available)
+            size_t left = space;
+            if (header_off < header.size())
             {
-                // Need stuffing
-                int stuffing_len = available - total_remaining;
-                // If adaptation field exists, extend it.
-                // If not, create it.
-                if (adaptation_field_control & 0x20)
-                {
-                    // Adaptation field exists.
-                    // Update length.
-                    // We need to find where adaptation length byte is.
-                    // It's at byte 4.
-                    uint8_t current_len = bsw.Bits()[4];
-                    bsw.SetByte(current_len + stuffing_len, 4);
-                    // We need to insert stuffing bytes.
-                    // BitStreamWriter doesn't support insertion.
-                    // This is tricky with BitStreamWriter as implemented.
-                    // But wait, we haven't written payload yet.
-                    // We can just write stuffing bytes into adaptation field now.
-                    for (int i = 0; i < stuffing_len; i++)
-                        bsw.PutByte(0xFF);
-                    head_len += stuffing_len;
-                }
-                else
-                {
-                    // Create adaptation field
-                    // This changes header!
-                    // We need to rewrite header or plan ahead.
-                    // Adaptation field control: 0x01 -> 0x03 (Adaptation + Payload)
-                    uint8_t val = bsw.Bits()[3];
-                    bsw.SetByte(val | 0x20, 3); // Set Adaptation bit (bit 5) to make it 0x3 (11)
-
-                    // Adaptation length = stuffing_len - 1.
-                    if (stuffing_len < 1)
-                    {
-                        // Should not happen if available > total_remaining
-                    }
-                    bsw.PutByte(stuffing_len - 1);
-                    if (stuffing_len > 1)
-                    {
-                        bsw.PutByte(0); // flags
-                        for (int i = 0; i < stuffing_len - 2; i++)
-                            bsw.PutByte(0xFF);
-                    }
-                    head_len += stuffing_len;
-                }
-                available = TS_PACKET_SIZE - head_len;
+                const size_t n = std::min(left, header.size() - header_off);
+                bsw.PutBytes(header.data() + header_off, n);
+                header_off += n;
+                left -= n;
             }
-
-            // Write payload
-            if (remaining_payload > 0)
+            if (left > 0 && data_off < size)
             {
-                int to_write = std::min((size_t)available, remaining_payload);
-                bsw.PutBytes(payload.data(), to_write);
-                payload.erase(payload.begin(), payload.begin() + to_write);
-                available -= to_write;
+                const size_t n = std::min(left, size - data_off);
+                bsw.PutBytes(data + data_off, n);
+                data_off += n;
+                left -= n;
             }
 
-            // Write data
-            if (available > 0 && remaining_data > 0)
-            {
-                int to_write = std::min((size_t)available, remaining_data);
-                bsw.PutBytes(data + offset, to_write);
-                offset += to_write;
-                available -= to_write;
-            }
-
-            // Fill remaining with 0xFF if any (should be handled by stuffing logic above, but just in
-            // case)
-            if (available > 0)
-            {
-                bsw.FillRemainData(0xFF);
-            }
-
-            if (on_packet_)
-            {
-                on_packet_(bsw.Bits());
-            }
-
-            first_pes_packet = false;
-            if (offset >= size && payload.empty())
-                break;
+            EmitPacket(bsw);
+            first = false;
         }
     }
 

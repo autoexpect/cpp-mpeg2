@@ -1,26 +1,33 @@
 #include "mpeg2/codec_utils.h"
 
+#include <cstddef>
 #include <cstring>
+#include <stdexcept>
 
 #include "mpeg2/bitstream.h"
 
 namespace mpeg2
 {
 
-    static int FindStartCode(const uint8_t *data, size_t size, int *start_code_len)
+    // Returns the offset of the next Annex-B start code, or -1. `size` is a size_t,
+    // so the return type must be able to hold any offset within it.
+    static ptrdiff_t FindStartCode(const uint8_t *data, size_t size, int *start_code_len)
     {
-        for (size_t i = 0; i < size; i++)
+        for (size_t i = 0; i + 3 <= size; i++)
         {
-            if (size - i >= 4 && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x00 &&
-                data[i + 3] == 0x01)
+            if (data[i] != 0x00 || data[i + 1] != 0x00)
             {
-                *start_code_len = 4;
-                return i;
+                continue;
             }
-            if (size - i >= 3 && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01)
+            if (data[i + 2] == 0x01)
             {
                 *start_code_len = 3;
-                return i;
+                return (ptrdiff_t)i;
+            }
+            if (data[i + 2] == 0x00 && i + 4 <= size && data[i + 3] == 0x01)
+            {
+                *start_code_len = 4;
+                return (ptrdiff_t)i;
             }
         }
         return -1;
@@ -29,19 +36,24 @@ namespace mpeg2
     void CodecUtils::SplitFrame(const uint8_t *data, size_t size,
                                 std::function<bool(const uint8_t *nalu, size_t len)> on_nalu)
     {
+        if (data == nullptr || !on_nalu)
+        {
+            return;
+        }
+
         int start_code_len = 0;
-        int pos = FindStartCode(data, size, &start_code_len);
+        ptrdiff_t pos = FindStartCode(data, size, &start_code_len);
         while (pos != -1)
         {
             const uint8_t *nalu_start = data + pos + start_code_len;
-            size_t remaining = size - (pos + start_code_len);
+            size_t remaining = size - ((size_t)pos + start_code_len);
 
             int next_start_code_len = 0;
-            int next_pos = FindStartCode(nalu_start, remaining, &next_start_code_len);
+            ptrdiff_t next_pos = FindStartCode(nalu_start, remaining, &next_start_code_len);
 
-            size_t nalu_len = (next_pos == -1) ? remaining : next_pos;
+            size_t nalu_len = (next_pos == -1) ? remaining : (size_t)next_pos;
 
-            if (!on_nalu(nalu_start, nalu_len))
+            if (nalu_len > 0 && !on_nalu(nalu_start, nalu_len))
             {
                 return;
             }
@@ -90,10 +102,17 @@ namespace mpeg2
         // Skip NALU header (1 byte)
         if (len < 2)
             return false;
-        BitStream bs(nalu + 1, len - 1);
-        // first_mb_in_slice is UE
-        uint64_t first_mb = bs.ReadUE();
-        return first_mb == 0;
+        try
+        {
+            BitStream bs(nalu + 1, len - 1);
+            // first_mb_in_slice is UE
+            return bs.ReadUE() == 0;
+        }
+        catch (const std::exception &)
+        {
+            // Truncated or corrupt slice header: not a usable AU boundary.
+            return false;
+        }
     }
 
     int CodecUtils::GetH265NaluType(const uint8_t *nalu, size_t len)

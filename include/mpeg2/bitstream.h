@@ -62,7 +62,8 @@ namespace mpeg2
         size_t Size() const;
 
     private:
-        void expandSpace(int n);
+        // Ensures at least `bits` more bits can be written from the current position.
+        void expandSpace(size_t bits);
 
         std::vector<uint8_t> bits_;
         size_t byteOffset_;

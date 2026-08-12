@@ -1,6 +1,9 @@
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "mpeg2/aac_utils.h"
@@ -9,244 +12,241 @@
 
 using namespace mpeg2;
 
-bool read_file(const std::string &path, std::string &content)
+namespace
 {
-    std::ifstream in(path, std::ios::binary | std::ios::ate);
-    if (!in)
-        return false;
-    size_t size = in.tellg();
-    in.seekg(0, std::ios::beg);
-    content.resize(size);
-    in.read(&content[0], size);
-    return true;
-}
+
+    bool ReadFile(const std::string &path, std::vector<uint8_t> &out)
+    {
+        std::ifstream in(path, std::ios::binary | std::ios::ate);
+        if (!in)
+            return false;
+        const std::streamoff size = in.tellg();
+        if (size < 0)
+            return false;
+        in.seekg(0, std::ios::beg);
+        out.resize((size_t)size);
+        if (size > 0 && !in.read((char *)out.data(), size))
+            return false;
+        return true;
+    }
+
+    void AppendAnnexB(std::vector<uint8_t> &dst, const uint8_t *nalu, size_t len)
+    {
+        static const uint8_t kStartCode[4] = {0x00, 0x00, 0x00, 0x01};
+        dst.insert(dst.end(), kStartCode, kStartCode + 4);
+        dst.insert(dst.end(), nalu, nalu + len);
+    }
+
+    bool HasSuffix(const std::string &s, const std::string &suffix)
+    {
+        return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
+
+} // namespace
 
 int main(int argc, char **argv)
 {
     if (argc < 3)
     {
-        std::cerr << "Usage: " << argv[0] << " <input_file> <output_ts_file> [interval_ms]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <input_video> <output_ts> [interval_ms] [input_aac]"
+                  << std::endl;
         return 1;
     }
 
-    std::string input_file = argv[1];
-    std::string output_file = argv[2];
+    const std::string input_file = argv[1];
+    const std::string output_file = argv[2];
+    const bool is_h265 = HasSuffix(input_file, ".h265") || HasSuffix(input_file, ".hevc");
 
-    bool is_h265 = false;
-    if (input_file.size() >= 5 && input_file.substr(input_file.size() - 5) == ".h265")
-    {
-        is_h265 = true;
-    }
-
-    int interval = 40; // Default 40ms (25fps)
+    int interval = 40; // ms per frame, default 25 fps
     if (argc >= 4)
     {
-        interval = std::stoi(argv[3]);
+        interval = std::atoi(argv[3]);
+        if (interval <= 0)
+        {
+            std::cerr << "Invalid interval_ms: " << argv[3] << std::endl;
+            return 1;
+        }
     }
 
-    std::string aac_file = "test.aac";
+    // Audio is optional: only muxed when a readable AAC file is given.
+    std::vector<uint8_t> aac_content;
+    std::vector<std::pair<size_t, size_t>> aac_frames; // offset, length into aac_content
+    int aac_sample_rate = 0;
     if (argc >= 5)
     {
-        aac_file = argv[4];
+        if (!ReadFile(argv[4], aac_content))
+        {
+            std::cerr << "Failed to read " << argv[4] << std::endl;
+            return 1;
+        }
+        SplitAACFrame(aac_content.data(), aac_content.size(),
+                      [&](const uint8_t *frame, size_t size)
+                      {
+                          if (aac_frames.empty())
+                          {
+                              ADTS_Frame_Header hdr;
+                              hdr.Decode(frame);
+                              aac_sample_rate = ADTSSampleRate(hdr.Fix_Header.Sampling_frequency_index);
+                          }
+                          aac_frames.push_back(
+                              std::make_pair((size_t)(frame - aac_content.data()), size));
+                      });
+        if (aac_frames.empty() || aac_sample_rate == 0)
+        {
+            std::cerr << "No usable ADTS frames in " << argv[4] << std::endl;
+            return 1;
+        }
+        std::cout << "AAC frames: " << aac_frames.size() << " @ " << aac_sample_rate << " Hz"
+                  << std::endl;
     }
 
-    std::string aac_content;
-    if (!read_file(aac_file, aac_content))
+    std::vector<uint8_t> video;
+    if (!ReadFile(input_file, video))
     {
-        std::cerr << "Failed to read " << aac_file << std::endl;
-        // return -1; // Don't fail if audio file missing, just skip audio? Or fail?
-        // User request says "use parameter to pass in", implying they want to test it.
-        // So failing is appropriate if they specified it or if we rely on it.
-        return -1;
+        std::cerr << "Failed to read " << input_file << std::endl;
+        return 1;
     }
-
-    std::vector<std::string> aac_frames;
-    mpeg2::SplitAACFrame((const uint8_t *)aac_content.data(), aac_content.size(),
-                         [&](const uint8_t *data, int size)
-                         { aac_frames.push_back(std::string((const char *)data, size)); });
-
-    std::cout << "AAC frames: " << aac_frames.size() << std::endl;
-
-    TSMuxer muxer;
-    uint16_t video_pid = muxer.AddStream(is_h265 ? TS_STREAM_H265 : TS_STREAM_H264);
-    uint16_t audio_pid = muxer.AddStream(mpeg2::TS_STREAM_AAC);
 
     std::ofstream out(output_file, std::ios::binary);
     if (!out)
     {
-        std::cerr << "Failed to open output file" << std::endl;
+        std::cerr << "Failed to open output file " << output_file << std::endl;
+        return 1;
+    }
+
+    TSMuxer muxer;
+    const uint16_t video_pid = muxer.AddStream(is_h265 ? TS_STREAM_H265 : TS_STREAM_H264);
+    const uint16_t audio_pid = aac_frames.empty() ? TS_INVALID_PID : muxer.AddStream(TS_STREAM_AAC);
+    if (video_pid == TS_INVALID_PID)
+    {
+        std::cerr << "Failed to allocate a video PID" << std::endl;
         return 1;
     }
 
     muxer.SetOnPacket([&](const std::vector<uint8_t> &packet)
                       { out.write((const char *)packet.data(), packet.size()); });
 
-    // Read file content
-    std::ifstream in(input_file, std::ios::binary | std::ios::ate);
-    if (!in)
-    {
-        std::cerr << "Failed to open input file" << std::endl;
-        return 1;
-    }
-    size_t size = in.tellg();
-    in.seekg(0, std::ios::beg);
-    std::vector<uint8_t> buffer(size);
-    in.read((char *)buffer.data(), size);
-
+    // Access unit assembly state. Timestamps are in 90 kHz units.
+    const uint64_t frame_ticks = (uint64_t)interval * 90;
     uint64_t pts = 0;
-    uint64_t dts = 0;
-
-    uint64_t audio_pts = 0;
+    uint64_t audio_samples = 0; // total AAC samples emitted, drives the audio clock
     size_t aac_idx = 0;
 
     std::vector<uint8_t> au_buffer;
+    std::vector<uint8_t> last_vps, last_sps, last_pps;
     bool has_vcl = false;
+    bool au_has_vps = false, au_has_sps = false, au_has_pps = false;
 
-    CodecUtils::SplitFrame(buffer.data(), size, [&](const uint8_t *nalu, size_t len)
-                           {
-        bool new_au = false;
-        bool is_vcl = false;
-        bool is_aud = false;
-        bool is_sps_pps = false;
-        bool is_idr = false;
+    auto flush_au = [&]()
+    {
+        if (au_buffer.empty())
+            return;
+        muxer.Write(video_pid, au_buffer.data(), au_buffer.size(), pts, pts);
 
-        // Cache for parameter sets
-        static std::vector<uint8_t> last_vps;
-        static std::vector<uint8_t> last_sps;
-        static std::vector<uint8_t> last_pps;
+        // Interleave every audio frame that belongs before the next video frame.
+        while (audio_pid != TS_INVALID_PID && !aac_frames.empty())
+        {
+            const uint64_t apts = audio_samples * TS_CLOCK_HZ / (uint64_t)aac_sample_rate;
+            if (apts >= pts)
+                break;
+            const std::pair<size_t, size_t> &f = aac_frames[aac_idx];
+            muxer.Write(audio_pid, aac_content.data() + f.first, f.second, apts, apts);
+            audio_samples += 1024; // one AAC access unit
+            if (++aac_idx >= aac_frames.size())
+                aac_idx = 0; // loop the audio track to cover the whole video
+        }
 
-        // Flags for current AU
-        static bool au_has_vps = false;
-        static bool au_has_sps = false;
-        static bool au_has_pps = false;
+        pts += frame_ticks;
+        au_buffer.clear();
+        has_vcl = false;
+        au_has_vps = au_has_sps = au_has_pps = false;
+    };
 
-        if (is_h265) {
-            int type = CodecUtils::GetH265NaluType(nalu, len);
-            is_vcl = CodecUtils::IsH265VCL(nalu, len);
-            is_aud = CodecUtils::IsH265AUD(nalu, len);
-            is_idr = CodecUtils::IsH265IDR(nalu, len);
+    CodecUtils::SplitFrame(
+        video.data(), video.size(),
+        [&](const uint8_t *nalu, size_t len)
+        {
+            bool new_au = false;
+            bool is_parameter_set = false;
+            const int type = is_h265 ? CodecUtils::GetH265NaluType(nalu, len)
+                                     : CodecUtils::GetNaluType(nalu, len);
+            const bool is_vcl =
+                is_h265 ? CodecUtils::IsH265VCL(nalu, len) : CodecUtils::IsH264VCL(nalu, len);
+            const bool is_aud =
+                is_h265 ? CodecUtils::IsH265AUD(nalu, len) : CodecUtils::IsH264AUD(nalu, len);
+            const bool is_idr =
+                is_h265 ? CodecUtils::IsH265IDR(nalu, len) : CodecUtils::IsH264IDR(nalu, len);
 
-            if (type == H265_NAL_VPS) {
+            if (is_h265 && type == H265_NAL_VPS)
+            {
                 last_vps.assign(nalu, nalu + len);
                 au_has_vps = true;
-                is_sps_pps = true;
-            } else if (type == H265_NAL_SPS) {
+                is_parameter_set = true;
+            }
+            else if (type == (is_h265 ? (int)H265_NAL_SPS : (int)H264_NAL_SPS))
+            {
                 last_sps.assign(nalu, nalu + len);
                 au_has_sps = true;
-                is_sps_pps = true;
-            } else if (type == H265_NAL_PPS) {
+                is_parameter_set = true;
+            }
+            else if (type == (is_h265 ? (int)H265_NAL_PPS : (int)H264_NAL_PPS))
+            {
                 last_pps.assign(nalu, nalu + len);
                 au_has_pps = true;
-                is_sps_pps = true;
+                is_parameter_set = true;
             }
 
-            if (is_aud) new_au = true;
-            if (is_sps_pps) {
-                if (has_vcl) new_au = true;
-            }
-            if (is_vcl) {
-                if (has_vcl) {
-                    // Check if it is the first slice of a new picture
-                    if (CodecUtils::IsH265FirstSlice(nalu, len)) {
-                        new_au = true;
-                    }
-                }
-            }
-        } else {
-            int type = CodecUtils::GetNaluType(nalu, len);
-            is_vcl = CodecUtils::IsH264VCL(nalu, len);
-            is_aud = CodecUtils::IsH264AUD(nalu, len);
-            is_idr = CodecUtils::IsH264IDR(nalu, len);
-
-            if (type == H264_NAL_SPS) {
-                last_sps.assign(nalu, nalu + len);
-                au_has_sps = true;
-                is_sps_pps = true;
-            } else if (type == H264_NAL_PPS) {
-                last_pps.assign(nalu, nalu + len);
-                au_has_pps = true;
-                is_sps_pps = true;
+            if (is_aud)
+                new_au = true;
+            if (is_parameter_set && has_vcl)
+                new_au = true;
+            if (is_vcl && has_vcl)
+            {
+                const bool first_slice = is_h265 ? CodecUtils::IsH265FirstSlice(nalu, len)
+                                                 : CodecUtils::IsH264FirstSlice(nalu, len);
+                if (first_slice)
+                    new_au = true;
             }
 
-            if (is_aud) new_au = true;
-            if (is_sps_pps) {
-                if (has_vcl) new_au = true;
+            if (new_au)
+            {
+                flush_au();
             }
-            if (is_vcl) {
-                if (has_vcl) {
-                    // Check if it is the first slice of a new picture
-                    if (CodecUtils::IsH264FirstSlice(nalu, len)) {
-                        new_au = true;
-                    }
-                }
-            }
-        }
 
-        if (new_au && !au_buffer.empty()) {
-            muxer.Write(video_pid, au_buffer.data(), au_buffer.size(), pts, dts);
-
-            // Write Audio frames to catch up
-            while (audio_pts < pts && aac_idx < aac_frames.size()) {
-                muxer.Write(audio_pid, (const uint8_t*)aac_frames[aac_idx].data(), aac_frames[aac_idx].size(), audio_pts, audio_pts);
-                audio_pts += (1024 * 90000) / 44100;
-                aac_idx++;
-            }
-            if (aac_idx >= aac_frames.size()) aac_idx = 0;  // Loop audio
-
-            pts += interval * 90;  // interval is in ms, pts is 90kHz. 1ms = 90 ticks.
-            dts += interval * 90;
-            au_buffer.clear();
-            has_vcl = false;
-
-            // Reset AU flags for new AU
-            au_has_vps = false;
-            au_has_sps = false;
-            au_has_pps = false;
-        }
-
-        // If this is an IDR frame, check if we need to insert parameter sets
-        if (is_idr) {
-            if (is_h265) {
-                if (!au_has_vps && !last_vps.empty()) {
-                    au_buffer.push_back(0x00);
-                    au_buffer.push_back(0x00);
-                    au_buffer.push_back(0x00);
-                    au_buffer.push_back(0x01);
-                    au_buffer.insert(au_buffer.end(), last_vps.begin(), last_vps.end());
+            // Repeat the parameter sets ahead of every IDR so the stream stays
+            // decodable from any random access point.
+            if (is_idr)
+            {
+                if (is_h265 && !au_has_vps && !last_vps.empty())
+                {
+                    AppendAnnexB(au_buffer, last_vps.data(), last_vps.size());
                     au_has_vps = true;
                 }
+                if (!au_has_sps && !last_sps.empty())
+                {
+                    AppendAnnexB(au_buffer, last_sps.data(), last_sps.size());
+                    au_has_sps = true;
+                }
+                if (!au_has_pps && !last_pps.empty())
+                {
+                    AppendAnnexB(au_buffer, last_pps.data(), last_pps.size());
+                    au_has_pps = true;
+                }
             }
-            if (!au_has_sps && !last_sps.empty()) {
-                au_buffer.push_back(0x00);
-                au_buffer.push_back(0x00);
-                au_buffer.push_back(0x00);
-                au_buffer.push_back(0x01);
-                au_buffer.insert(au_buffer.end(), last_sps.begin(), last_sps.end());
-                au_has_sps = true;
-            }
-            if (!au_has_pps && !last_pps.empty()) {
-                au_buffer.push_back(0x00);
-                au_buffer.push_back(0x00);
-                au_buffer.push_back(0x00);
-                au_buffer.push_back(0x01);
-                au_buffer.insert(au_buffer.end(), last_pps.begin(), last_pps.end());
-                au_has_pps = true;
-            }
-        }
 
-        au_buffer.push_back(0x00);
-        au_buffer.push_back(0x00);
-        au_buffer.push_back(0x00);
-        au_buffer.push_back(0x01);
-        au_buffer.insert(au_buffer.end(), nalu, nalu + len);
-        if (is_vcl) has_vcl = true;
+            AppendAnnexB(au_buffer, nalu, len);
+            if (is_vcl)
+                has_vcl = true;
+            return true;
+        });
 
-        return true; });
+    flush_au();
 
-    if (!au_buffer.empty())
+    out.flush();
+    if (!out)
     {
-        muxer.Write(video_pid, au_buffer.data(), au_buffer.size(), pts, dts);
+        std::cerr << "Failed to write " << output_file << std::endl;
+        return 1;
     }
-
     return 0;
 }

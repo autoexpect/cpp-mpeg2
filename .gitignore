@@ -12,3 +12,4 @@ compile_commands.json
 *.h265
 *.ts
 *.ps
+*.d
